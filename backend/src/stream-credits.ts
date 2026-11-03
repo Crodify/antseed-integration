@@ -157,7 +157,12 @@ export async function creditStreams(
       gdAmountWei: entry.gdAmountWei
     });
     counts.processed += 1;
-    fundings.push(fundCredit(entry, store, antseedFundingVault));
+    const funding = fundCredit(entry, store, antseedFundingVault, cfg.reportFailure).catch(async (error) => {
+      await cfg.reportFailure?.({ operation: "funding.background", chain: "base", error, entryId: entry.id, buyer: buyerAddress || account });
+      return { fundingStatus: "failed" };
+    });
+    ctx.waitUntil(funding);
+    fundings.push(funding);
   }
 
   if (nextCursor > closedAfter) await kv.put(STREAM_CLOSED_PERIODS_CURSOR_KEY, nextCursor.toString());

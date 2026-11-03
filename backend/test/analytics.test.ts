@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { getAnalyticsWindow, resolveRunDate, runAnalyticsAggregation } from "../src/analytics.js";
 import { Env } from "../src/env.js";
+import { encodeVaultEventLog } from "../src/celo-events.js";
 
 class MemoryKV {
   private data = new Map<string, string>();
@@ -123,6 +124,74 @@ function buildOfflineAnalyticsFetchMock(options: {
     throw new Error(`unexpected fetch url: ${url.toString()}`);
   }) as typeof fetch;
 }
+
+test("analytics skips malformed events and empty RPC discovery without new alerts", { concurrency: false }, async () => {
+  const originalFetch = globalThis.fetch;
+  const now = new Date("2026-07-24T12:00:00.000Z");
+  const dayStartUnix = Math.floor(new Date("2026-07-24T00:00:00.000Z").getTime() / 1000);
+  const vault = "0x0000000000000000000000000000000000000abc";
+  const messages: string[] = [];
+  const offline = buildOfflineAnalyticsFetchMock({ dayStartUnix, dayEndUnix: dayStartUnix + 86_399, streamPeriods: [] });
+  const log = encodeVaultEventLog("GdDeposited", [vault, vault, 1n, "0x"], vault, `0x${"a".repeat(64)}`, 0);
+  try {
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (url.host === "slack.test") {
+        messages.push(JSON.parse(String(init?.body)).text);
+        return new Response("ok");
+      }
+      if (url.host === "chainlist.org") return Response.json([]);
+      if (["forno.celo.org", "rpc.ankr.com", "mainnet.base.org"].includes(url.host)) {
+        const body = JSON.parse(String(init?.body));
+        if (body.method === "eth_getLogs" && body.params[0].address.toLowerCase() === vault) {
+          return Response.json({ jsonrpc: "2.0", id: body.id, result: [{ ...log, data: "0x" }, { ...log, data: "0x" }] });
+        }
+        return offline(url.host === "mainnet.base.org" ? "https://base.rpc.test" : "https://celo.rpc.test", init);
+      }
+      return offline(input, init);
+    }) as typeof fetch;
+    await runAnalyticsAggregation(env({
+      SLACK_WEBHOOK_URL: "https://slack.test", CELO_VAULT_ADDRESS: vault,
+      CELO_BLOCKSCOUT_API_URL: "https://celo.blockscout.test/api"
+    }), now);
+    assert.equal(messages.length, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("analytics retains existing missing-data fallbacks and GraphQL error handling", { concurrency: false }, async () => {
+  const originalFetch = globalThis.fetch;
+  const now = new Date("2026-07-24T12:00:00.000Z");
+  const dayStartUnix = Math.floor(new Date("2026-07-24T00:00:00.000Z").getTime() / 1000);
+  const offline = buildOfflineAnalyticsFetchMock({ dayStartUnix, dayEndUnix: dayStartUnix + 86_399, streamPeriods: [] });
+  try {
+    for (const payload of [
+      { data: {} },
+      { errors: [{ message: "indexer incomplete" }], data: { streamPeriods: [] } },
+      { data: { streamPeriods: [{ sender: { id: "0x0000000000000000000000000000000000000abc" }, stream: { userData: "0x" } }] } }
+    ]) {
+      const testEnv = env({
+        CELO_VAULT_ADDRESS: "0x0000000000000000000000000000000000000abc",
+        CELO_GD_SUPERTOKEN_ADDRESS: "0x0000000000000000000000000000000000000def",
+        CELO_BLOCKSCOUT_API_URL: "https://celo.blockscout.test/api", SUPERFLUID_SUBGRAPH_URL: "https://superfluid.test"
+      });
+      globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+        if (String(input).startsWith("https://superfluid.test")) return Response.json(payload);
+        return offline(input, init);
+      }) as typeof fetch;
+      if ("errors" in payload) {
+        await assert.rejects(runAnalyticsAggregation(testEnv, now), /Superfluid subgraph error/);
+        assert.equal(await testEnv.ANTSEED_KV.get("analytics:state"), null);
+      } else {
+        await runAnalyticsAggregation(testEnv, now);
+        assert.equal((await getAnalyticsWindow(testEnv, 1, now)).daily[0].gdStreamedWei, "0");
+      }
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
 
 test("resolveRunDate advances to finalizedThroughDate + 1 when still behind today", () => {
   const state = {

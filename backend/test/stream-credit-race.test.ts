@@ -2,9 +2,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import worker from "../src/worker.js";
 import { AntSeedFundingVaultClient } from "../src/antseed-funding-vault.js";
-import { Env } from "../src/env.js";
+import { Env, configFromEnv } from "../src/env.js";
 import { KVCreditStore } from "../src/kv-credit-store.js";
 import { encodeVaultEventLog } from "../src/celo-events.js";
+import { creditStreams } from "../src/stream-credits.js";
+import type { FailureDetails } from "../src/http.js";
 
 class MemoryKV {
   private data = new Map<string, string>();
@@ -91,6 +93,43 @@ function closedStreamScenario() {
   const owedWei = RATE * BigInt(closedAt - (nowSeconds - 20 * DAY));
   return { nowSeconds, openedAt, closedAt, lastCreditAt, owedWei };
 }
+
+test("background stream funding failures alert and retain the same retry window", { concurrency: false }, async () => {
+  const account = "0x0000000000000000000000000000000000000b99";
+  const kv = new MemoryKV();
+  const scenario = closedStreamScenario();
+  const originalFetch = globalThis.fetch;
+  const originalDeposit = AntSeedFundingVaultClient.prototype.depositForBuyerWithId;
+  const failures: FailureDetails[] = [];
+  const ids: string[] = [];
+  try {
+    await seedProfile(kv, account, scenario.lastCreditAt);
+    globalThis.fetch = subgraphMock(account, scenario, null);
+    AntSeedFundingVaultClient.prototype.depositForBuyerWithId = async function (_buyer, _principal, _bonus, id, requireMinimum) {
+      assert.equal(requireMinimum, false, "direct-deposit guard must not alter stream policy");
+      ids.push(id);
+      throw Object.assign(new Error("BelowMinDeposit"), { code: "CALL_EXCEPTION" });
+    };
+    const cfg = configFromEnv(testEnv(kv));
+    cfg.reportFailure = async (details) => { failures.push(details); };
+    const store = new KVCreditStore(kv as never);
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const { ctx, settle } = trackingContext();
+      await creditStreams(cfg, kv as never, store, new AntSeedFundingVaultClient(cfg), ctx);
+      await settle();
+      const entries = await store.getGdCredits(account);
+      assert.equal(entries.length, 1);
+      assert.equal(entries[0].fundingStatus, "failed");
+      assert.equal((await store.getUser(account)).lastStreamCreditAt, scenario.lastCreditAt);
+      assert.equal(failures.filter((failure) => failure.operation === "funding.deposit").length, attempt + 1);
+    }
+    assert.equal(ids.length, 2);
+    assert.equal(ids[0], ids[1]);
+  } finally {
+    AntSeedFundingVaultClient.prototype.depositForBuyerWithId = originalDeposit;
+    globalThis.fetch = originalFetch;
+  }
+});
 
 function subgraphMock(account: string, scenario: ReturnType<typeof closedStreamScenario>, closeLog: unknown) {
   return (async (_url: string | URL | Request, init?: RequestInit) => {

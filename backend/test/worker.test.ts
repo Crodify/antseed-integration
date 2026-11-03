@@ -3,11 +3,12 @@ import assert from "node:assert/strict";
 import { Interface, Wallet } from "ethers";
 import worker from "../src/worker.js";
 import { fundCredit } from "../src/funding.js";
-import { AntSeedFundingVaultClient } from "../src/antseed-funding-vault.js";
-import { Env } from "../src/env.js";
+import { AntSeedFundingVaultClient, BuyerDepositBelowMinimum } from "../src/antseed-funding-vault.js";
+import { Env, configFromEnv } from "../src/env.js";
 import { KVCreditStore } from "../src/kv-credit-store.js";
 import { encodeVaultEventLog } from "../src/celo-events.js";
 import { GdCreditEntry } from "../src/types.js";
+import { notifySlackOnFailure } from "../src/http.js";
 
 class MemoryKV {
   private data = new Map<string, string>();
@@ -475,7 +476,7 @@ test("/v1/celo/events/record requires valid input", async () => {
   assert.equal(res.status, 400);
 });
 
-test("request exceptions send slack webhook with path, body, and error", { concurrency: false }, async () => {
+test("request exceptions send slack webhook with the request body", { concurrency: false }, async () => {
   const originalFetch = globalThis.fetch;
   const webhookCalls: Array<{ url: string; body: { text: string } }> = [];
   const pending: Array<Promise<unknown>> = [];
@@ -512,9 +513,106 @@ test("request exceptions send slack webhook with path, body, and error", { concu
     assert.equal(res.status, 500);
     assert.equal(webhookCalls.length, 1);
     assert.equal(webhookCalls[0].url, "https://hooks.slack.test/services/example");
+    assert.match(webhookCalls[0].body.text, /operation: POST:\/v1\/celo\/events\/record/);
     assert.match(webhookCalls[0].body.text, /path: \/v1\/celo\/events\/record\?source=test/);
     assert.match(webhookCalls[0].body.text, /body: \{"txHash":"0x2222/);
-    assert.match(webhookCalls[0].body.text, /error: content-type must be application\/json/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("operational failure reports are deduplicated and omit remote secrets", { concurrency: false }, async () => {
+  const originalFetch = globalThis.fetch;
+  const messages: string[] = [];
+  try {
+    globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+      messages.push(JSON.parse(String(init?.body)).text);
+      return new Response("ok");
+    }) as typeof fetch;
+    const error = Object.assign(new Error("https://rpc.test/secret?signature=private"), { code: "CALL_EXCEPTION" });
+    const details = { operation: "funding.deposit", chain: "base" as const, error };
+    const testEnv = env({ SLACK_WEBHOOK_URL: "https://slack.test" });
+    await notifySlackOnFailure(testEnv, details);
+    await notifySlackOnFailure(testEnv, details);
+    assert.equal(messages.length, 1);
+    assert.match(messages[0], /category: CALL_EXCEPTION/);
+    assert.doesNotMatch(messages[0], /secret|signature|private|rpc.test/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("HTTP deposit funding failures notify Slack despite a successful ingestion response", { concurrency: false }, async () => {
+  const originalFetch = globalThis.fetch;
+  const originalDeposit = AntSeedFundingVaultClient.prototype.depositForBuyerWithId;
+  const messages: string[] = [];
+  const account = "0x0000000000000000000000000000000000000abc";
+  const vault = "0x0000000000000000000000000000000000000def";
+  const txHash = `0x${"d".repeat(64)}`;
+  try {
+    AntSeedFundingVaultClient.prototype.depositForBuyerWithId = async () => {
+      throw Object.assign(new Error("private upstream payload"), { code: "TIMEOUT" });
+    };
+    globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+      if (String(url) === "https://slack.test") {
+        messages.push(JSON.parse(String(init?.body)).text);
+        return new Response("ok");
+      }
+      return Response.json({ result: { status: "0x1", logs: [0, 1].map((index) => encodeVaultEventLog("GdDeposited", [account, account, 10n ** 18n, "0x"], vault, txHash, index)) } });
+    }) as typeof fetch;
+    const response = await worker.fetch(new Request("https://worker.test/v1/celo/events/record", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ txHash })
+    }), env({ CELO_RPC_URL: "https://celo.test", CELO_VAULT_ADDRESS: vault, SLACK_WEBHOOK_URL: "https://slack.test" }), makeExecutionContext());
+    assert.equal(response.status, 200);
+    const body = await response.json() as { events: GdCreditEntry[] };
+    assert.equal(body.events[0].fundingStatus, "failed");
+    assert.equal(body.events[1].fundingStatus, "failed");
+    assert.equal(messages.length, 2);
+    assert.match(messages[0], /funding.deposit/);
+    assert.match(messages[0], /TIMEOUT/);
+    for (const message of messages) assert.match(message, new RegExp(`body: \\{"txHash":"${txHash}"\\}`));
+    assert.doesNotMatch(messages[0], /private upstream payload/);
+  } finally {
+    AntSeedFundingVaultClient.prototype.depositForBuyerWithId = originalDeposit;
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("reverted Celo receipts reach the request alert boundary", { concurrency: false }, async () => {
+  const originalFetch = globalThis.fetch;
+  const messages: string[] = [];
+  const pending: Promise<unknown>[] = [];
+  try {
+    globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+      if (String(url) === "https://slack.test") {
+        messages.push(JSON.parse(String(init?.body)).text);
+        return new Response("ok");
+      }
+      return Response.json({ result: { status: "0x0", logs: [] } });
+    }) as typeof fetch;
+    const ctx = { waitUntil(promise: Promise<unknown>) { pending.push(promise); } } as ExecutionContext;
+    const response = await worker.fetch(new Request("https://worker.test/v1/celo/events/record", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ txHash: `0x${"e".repeat(64)}` })
+    }), env({ CELO_RPC_URL: "https://celo.test", CELO_VAULT_ADDRESS: "0x0000000000000000000000000000000000000abc", SLACK_WEBHOOK_URL: "https://slack.test" }), ctx);
+    await Promise.all(pending);
+    assert.equal(response.status, 500);
+    assert.equal(messages.length, 1);
+    assert.match(messages[0], /TRANSACTION_REVERTED/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("Slack delivery failure is best effort and does not recurse", { concurrency: false }, async () => {
+  const originalFetch = globalThis.fetch;
+  let attempts = 0;
+  try {
+    globalThis.fetch = (async () => { attempts += 1; throw new Error("webhook offline"); }) as typeof fetch;
+    await notifySlackOnFailure(env({ SLACK_WEBHOOK_URL: "https://slack.test" }), { operation: "funding.deposit", error: new Error("failure") });
+    assert.equal(attempts, 1);
+    globalThis.fetch = (async () => { attempts += 1; return new Response("rejected", { status: 503 }); }) as typeof fetch;
+    await notifySlackOnFailure(env({ SLACK_WEBHOOK_URL: "https://slack.test" }), { operation: "funding.deposit", error: new Error("failure") });
+    assert.equal(attempts, 2);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -1533,6 +1631,105 @@ test("fundCredit deposits bonus-only credits when buyer still uses operator", as
   assert.equal(profile.totalOutstandingFundingUsd, "0");
   assert.equal(profile.totalBonusUsd, "40");
   assert.deepEqual(result.bridge, { enabled: true, buyer: buyer.toLowerCase(), amountUsd: "40", txHash: "0xfunded" });
+});
+
+test("direct deposit minimum follows the current buyer balance and excludes bonus", async (context) => {
+  const payer = "0x0000000000000000000000000000000000000abc";
+  const fundedBuyer = "0x0000000000000000000000000000000000000aaa";
+  const emptyBuyer = "0x0000000000000000000000000000000000000bbb";
+  const registryAddress = "0x0000000000000000000000000000000000000011";
+  const depositsAddress = "0x0000000000000000000000000000000000000022";
+  const registryAbi = new Interface(["function deposits() view returns (address)"]);
+  const depositsAbi = new Interface([
+    "function getBuyerBalance(address buyer) view returns (uint256 available, uint256 reserved, uint256 lastActivity)",
+    "function MIN_BUYER_DEPOSIT() view returns (uint256)"
+  ]);
+  const scenarios = [
+    { name: "old payer to empty new buyer", buyer: emptyBuyer, available: 0n, reserved: 0n, principal: 999_999n, bonus: 100_000n, rejected: true },
+    { name: "switch back to funded buyer", buyer: fundedBuyer, available: 1n, reserved: 0n, principal: 1n },
+    { name: "historically funded but empty buyer", buyer: fundedBuyer, available: 0n, reserved: 0n, principal: 1n, rejected: true },
+    { name: "reserved-only buyer", buyer: fundedBuyer, available: 0n, reserved: 1n, principal: 1n },
+    { name: "exact minimum", buyer: emptyBuyer, available: 0n, reserved: 0n, principal: 1_000_000n },
+    { name: "live minimum rather than hardcoded dollar", buyer: emptyBuyer, available: 0n, reserved: 0n, principal: 1_000_000n, minimum: 2_000_000n, rejected: true },
+    { name: "stream funding keeps existing policy", buyer: emptyBuyer, available: 0n, reserved: 0n, principal: 1n, source: "streamCron" as const },
+    { name: "used ID recovery skips minimum reads", buyer: emptyBuyer, available: 0n, reserved: 0n, principal: 1n, used: true },
+    { name: "read failure prevents submission", buyer: emptyBuyer, available: 0n, reserved: 0n, principal: 1_000_000n, readFails: true, rejected: true }
+  ];
+  for (const scenario of scenarios) {
+    await context.test(scenario.name, async () => {
+      const store = new KVCreditStore(new MemoryKV() as never);
+      const entry = await store.recordGdCredit({
+        id: `0x${"a".repeat(64)}:0`, account: payer, rootAccount: payer,
+        source: scenario.source ?? "deposit", gdAmountWei: 1n, isVerified: false,
+        gdPrice: 1, maxBonusCapUsd: 0n, regularBonusBps: 0n, streamingBonusBps: 0n,
+        buyerAddress: scenario.buyer
+      });
+      entry.principalUsd = scenario.principal.toString();
+      entry.bonusUsd = (scenario.bonus ?? 0n).toString();
+      entry.totalCreditUsd = (scenario.principal + (scenario.bonus ?? 0n)).toString();
+      let submissions = 0;
+      let registryReads = 0;
+      const cfg = configFromEnv(env());
+      const client = new AntSeedFundingVaultClient(cfg);
+      (client as unknown as { contract: unknown }).contract = {
+        async usedDepositIds() { return scenario.used ?? false; },
+        async registry() { registryReads += 1; return registryAddress; },
+        runner: {
+          async call(tx: { to: string; data: string }) {
+            if (tx.to.toLowerCase() === registryAddress) return registryAbi.encodeFunctionResult("deposits", [depositsAddress]);
+            if (scenario.readFails) throw new Error("RPC unavailable");
+            const parsed = depositsAbi.parseTransaction({ data: tx.data });
+            if (parsed?.name === "MIN_BUYER_DEPOSIT") return depositsAbi.encodeFunctionResult(parsed.name, [scenario.minimum ?? 1_000_000n]);
+            assert.equal(parsed?.args[0].toLowerCase(), scenario.buyer);
+            return depositsAbi.encodeFunctionResult("getBuyerBalance", [scenario.available, scenario.reserved, 0n]);
+          }
+        },
+        async depositForWithId() {
+          submissions += 1;
+          return { hash: `0x${"b".repeat(64)}`, async wait() { return { hash: `0x${"b".repeat(64)}` }; } };
+        }
+      };
+      const failures: unknown[] = [];
+      const result = await fundCredit(entry, store, client, async (details) => { failures.push(details.error); });
+      assert.equal(result.fundingStatus, scenario.rejected ? "failed" : "funded");
+      assert.equal(submissions, scenario.rejected || scenario.used ? 0 : 1);
+      assert.equal(registryReads, scenario.used || scenario.source === "streamCron" ? 0 : 1);
+      assert.equal(failures.length, scenario.rejected ? 1 : 0);
+      if (scenario.rejected && !scenario.readFails) assert.ok(failures[0] instanceof BuyerDepositBelowMinimum);
+    });
+  }
+});
+
+test("fundCredit reports a caught blockchain failure and preserves failed funding", { concurrency: false }, async () => {
+  const originalFetch = globalThis.fetch;
+  const calls: string[] = [];
+  try {
+    globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+      calls.push(JSON.parse(String(init?.body)).text);
+      return new Response("ok");
+    }) as typeof fetch;
+    const cfg = configFromEnv(env({ SLACK_WEBHOOK_URL: "https://slack.test" }));
+    const store = new KVCreditStore(new MemoryKV() as never);
+    const entry = await store.recordGdCredit({
+      id: `0x${"c".repeat(64)}:0`, account: "0x0000000000000000000000000000000000000abc",
+      source: "deposit", gdAmountWei: 10n ** 18n, isVerified: false,
+      gdPrice: 1, maxBonusCapUsd: 0n, regularBonusBps: 0n, streamingBonusBps: 0n
+    });
+    const error = Object.assign(new Error("transaction reverted: secret RPC details"), { code: "CALL_EXCEPTION" });
+    const vault = { enabled: true, async depositForBuyerWithId() { throw error; } };
+    const result = await fundCredit(entry, store, vault as never, cfg.reportFailure);
+    assert.equal(result.fundingStatus, "failed");
+    assert.equal(calls.length, 1);
+    assert.match(calls[0], /operation: funding.deposit/);
+    assert.match(calls[0], /category: CALL_EXCEPTION/);
+    assert.match(calls[0], new RegExp(entry.id));
+    assert.doesNotMatch(calls[0], /secret RPC details/);
+    await cfg.reportFailure?.({ operation: "outer.handler", error });
+    assert.equal(calls.length, 1);
+    assert.equal((await store.getGdCredits(entry.account))[0].fundingStatus, "failed");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 // The subgraph is the source of truth for whether a stream still exists. A closed stream reports

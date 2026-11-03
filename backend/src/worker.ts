@@ -9,7 +9,7 @@ import { SUPERFLUID_CELO_SUBGRAPH_URL } from "./stream-periods.js";
 import { GdCreditEntry } from "./types.js";
 import { errorMessage, logError, logInfo, logWarn, redactAddress, redactHash } from "./logging.js";
 import { getAnalyticsWindow, runAnalyticsAggregation, KVAnalyticsStore } from "./analytics.js";
-import { cors, json, notifySlackOnRequestError, parseJson, readRequestBody } from "./http.js";
+import { cors, json, notifySlackOnFailure, notifySlackOnRequestError, parseJson, readRequestBody } from "./http.js";
 import {
   ANALYTICS_CRON_BACKFILL_DAYS,
   ANALYTICS_REFRESH_COOLDOWN_MS,
@@ -106,7 +106,6 @@ export default {
       return response;
     } catch (err) {
       const message = errorMessage(err);
-      const requestBody = await readRequestBody(requestClone);
       logError("request.error", {
         method: request.method,
         path: url.pathname,
@@ -117,8 +116,9 @@ export default {
         notifySlackOnRequestError(env, {
           method: request.method,
           path: `${url.pathname}${url.search}`,
-          body: requestBody,
-          message
+          body: await readRequestBody(requestClone),
+          message,
+          error: err
         })
       );
       return json({ error: message }, 500);
@@ -126,16 +126,17 @@ export default {
   },
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
     const startedAt = Date.now();
-    const cfg = configFromEnv(env);
-    const store = new KVCreditStore(env.ANTSEED_KV);
-    const antseedFundingVault = new AntSeedFundingVaultClient(cfg);
-
-    logInfo("cron.start", {
-      bridgeEnabled: antseedFundingVault.enabled
-    });
-
-    const summary = await creditStreams(cfg, env.ANTSEED_KV, store, antseedFundingVault, ctx);
-    logInfo("cron.summary", { ...summary, elapsedMs: Date.now() - startedAt });
+    try {
+      const cfg = configFromEnv(env);
+      const store = new KVCreditStore(env.ANTSEED_KV);
+      const antseedFundingVault = new AntSeedFundingVaultClient(cfg);
+      logInfo("cron.start", { bridgeEnabled: antseedFundingVault.enabled });
+      const summary = await creditStreams(cfg, env.ANTSEED_KV, store, antseedFundingVault, ctx);
+      logInfo("cron.summary", { ...summary, elapsedMs: Date.now() - startedAt });
+    } catch (error) {
+      logError("cron.streams.failed", { message: errorMessage(error) });
+      await notifySlackOnFailure(env, { operation: "cron.streams", error });
+    }
 
     try {
       const summaries = await backFillAnalytics(env, ANALYTICS_CRON_BACKFILL_DAYS);
@@ -148,11 +149,9 @@ export default {
         message: errorMessage(error)
       });
       ctx.waitUntil(
-        notifySlackOnRequestError(env, {
-          method: "SCHEDULED",
-          path: "/v1/analytics/refresh",
-          body: undefined,
-          message: errorMessage(error)
+        notifySlackOnFailure(env, {
+          operation: "cron.analytics",
+          error
         })
       );
     }
@@ -162,6 +161,12 @@ export default {
 async function route(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
   const url = new URL(request.url);
   const cfg = configFromEnv(env);
+  const requestClone = request.clone();
+  let requestBody: Promise<string | undefined> | undefined;
+  cfg.reportFailure = async (details) => notifySlackOnFailure(env, {
+    ...details,
+    request: { method: request.method, path: `${url.pathname}${url.search}`, body: await (requestBody ??= readRequestBody(requestClone)) }
+  });
   const store = new KVCreditStore(env.ANTSEED_KV);
   const antseedFundingVault = new AntSeedFundingVaultClient(cfg);
 
@@ -330,7 +335,7 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
           rootAccount: redactAddress(entry.rootAccount),
           buyer: redactAddress(entry.buyerAddress)
         });
-        const res = await fundCredit(entry, store, antseedFundingVault);
+        const res = await fundCredit(entry, store, antseedFundingVault, cfg.reportFailure);
         recorded.push(res);
       } else {
         // Streams are credited by the scheduled run alone, from the subgraph's stream periods.
@@ -361,7 +366,7 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
           reportedTotalFlowWei: event.totalFlowWei.toString()
         });
         if (BigInt(entry.totalCreditUsd) === 0n) {
-          recorded.push(await fundCredit(entry, store, antseedFundingVault));
+          recorded.push(await fundCredit(entry, store, antseedFundingVault, cfg.reportFailure));
         } else {
           logWarn("celo.events.record.stream.legacy-entry-skipped", {
             entryId: entry.id,

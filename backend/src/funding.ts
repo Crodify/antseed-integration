@@ -2,11 +2,13 @@ import { AntSeedFundingVaultClient } from "./antseed-funding-vault.js";
 import { KVCreditStore } from "./kv-credit-store.js";
 import { GdCreditEntry } from "./types.js";
 import { errorMessage, logError, logInfo, logWarn, redactAddress, redactHash } from "./logging.js";
+import type { FailureReporter } from "./http.js";
 
 export async function fundCredit(
   entry: GdCreditEntry,
   store: KVCreditStore,
-  antseedFundingVault: AntSeedFundingVaultClient
+  antseedFundingVault: AntSeedFundingVaultClient,
+  reportFailure?: FailureReporter
 ): Promise<{ [key: string]: unknown }> {
   const buyer = entry.buyerAddress || entry.account;
   if (entry.fundingStatus === "funded") {
@@ -42,7 +44,7 @@ export async function fundCredit(
   try {
     const shouldCredit = principalUsd + bonusUsd > 0n;
     const bridge = shouldCredit
-      ? await antseedFundingVault.depositForBuyerWithId(buyer, principalUsd, bonusUsd, entry.id)
+      ? await antseedFundingVault.depositForBuyerWithId(buyer, principalUsd, bonusUsd, entry.id, entry.source === "deposit")
       : { enabled: antseedFundingVault.enabled, buyer, amountUsd: "0" };
     if (!shouldCredit) {
       logInfo("funding.skipped.zero-amount", {
@@ -73,6 +75,7 @@ export async function fundCredit(
     });
     return { ...updated, bridge };
   } catch (error) {
+    await reportFailure?.({ operation: "funding.deposit", chain: "base", error, entryId: entry.id, buyer });
     const message = errorMessage(error);
     logError("funding.failed", {
       entryId: entry.id,
@@ -81,10 +84,13 @@ export async function fundCredit(
       buyer: redactAddress(buyer),
       message
     });
-    const updated = await store.markFundingResult(entry, {
-      funded: false,
-      error: message
-    });
+    let updated: GdCreditEntry;
+    try {
+      updated = await store.markFundingResult(entry, { funded: false, error: message });
+    } catch (persistenceError) {
+      logError("funding.failure-persistence.failed", { entryId: entry.id, message: errorMessage(persistenceError) });
+      throw error;
+    }
     return {
       ...updated,
       depositId: entry.id,

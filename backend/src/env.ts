@@ -1,4 +1,5 @@
 import { parseEther, parseUnits } from "ethers";
+import { notifySlackOnFailure, type FailureReporter } from "./http.js";
 
 export interface Env {
   ANTSEED_KV: KVNamespace;
@@ -26,6 +27,7 @@ export interface Env {
 }
 
 export type RuntimeConfig = {
+  reportFailure?: FailureReporter;
   ANTSEED_FUNDING_RPC_URL?: string;
   ANTSEED_FUNDING_VAULT_ADDRESS?: string;
   ANTSEED_FUNDING_OPERATOR_PRIVATE_KEY?: string;
@@ -50,6 +52,7 @@ export type RuntimeConfig = {
 
 export function configFromEnv(env: Env): RuntimeConfig {
   return {
+    reportFailure: (details) => notifySlackOnFailure(env, details),
     ANTSEED_FUNDING_RPC_URL: env.ANTSEED_FUNDING_RPC_URL,
     ANTSEED_FUNDING_VAULT_ADDRESS: env.ANTSEED_FUNDING_VAULT_ADDRESS,
     ANTSEED_FUNDING_OPERATOR_PRIVATE_KEY: env.ANTSEED_FUNDING_OPERATOR_PRIVATE_KEY,

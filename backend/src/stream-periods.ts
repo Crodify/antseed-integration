@@ -136,6 +136,7 @@ export async function fetchStreamPeriods(cfg: RuntimeConfig, closedAfter: number
       lastId = batch[batch.length - 1].id;
     }
   } catch (error) {
+    await cfg.reportFailure?.({ operation: "celo.streams.subgraph", chain: "celo", error });
     logError("superfluid.periods.fetch.failed", {
       endpoint,
       receiver: redactAddress(receiver),

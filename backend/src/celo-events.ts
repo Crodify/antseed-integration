@@ -79,8 +79,11 @@ export async function fetchCeloVaultEvents(txHash: string, cfg: RuntimeConfig): 
     txHash: redactHash(txHash),
     vaultAddress: redactAddress(cfg.CELO_VAULT_ADDRESS)
   });
-  const receipt = await rpc<{ logs: RpcLog[] }>(cfg.CELO_RPC_URL, "eth_getTransactionReceipt", [txHash]);
-  if (!receipt) throw new Error(`transaction receipt not found: ${txHash}`);
+  const receipt = await rpc<{ status?: string | number; logs: RpcLog[] }>(cfg.CELO_RPC_URL, "eth_getTransactionReceipt", [txHash]);
+  if (!receipt) throw Object.assign(new Error(`transaction receipt not found: ${txHash}`), { name: "CeloReceiptPending" });
+  if (receipt.status === "0x0" || receipt.status === 0) {
+    throw Object.assign(new Error(`Celo transaction reverted: ${txHash}`), { name: "CeloTransactionReverted", receipt: { hash: txHash, status: 0 } });
+  }
   const parsed = parseCeloVaultLogs(receipt.logs, cfg.CELO_VAULT_ADDRESS);
   logInfo("celo.events.fetch.tx.end", {
     txHash: redactHash(txHash),
@@ -175,6 +178,7 @@ export async function fetchCurrentGdPrice(cfg: RuntimeConfig): Promise<number> {
     });
     return cfg.GD_CUSD_PRICE;
   } catch (error) {
+    await cfg.reportFailure?.({ operation: "celo.oracle.price", chain: "celo", recovered: true, error });
     logWarn("gd.price.fallback", {
       reason: "oracle_call_failed",
       oracleAddress: redactAddress(oracleAddress),

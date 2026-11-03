@@ -14,7 +14,20 @@ const FUNDING_VAULT_ABI = [
   "function usedDepositIds(bytes32 id) view returns (bool)"
 ] as const;
 const REGISTRY_ABI = ["function deposits() view returns (address)"] as const;
-const DEPOSITS_ABI = ["function getOperator(address buyer) view returns (address)"] as const;
+const DEPOSITS_ABI = [
+  "function getOperator(address buyer) view returns (address)",
+  "function getBuyerBalance(address buyer) view returns (uint256 available, uint256 reserved, uint256 lastActivity)",
+  "function MIN_BUYER_DEPOSIT() view returns (uint256)"
+] as const;
+
+/** A direct deposit must fund an empty buyer with sufficient principal, independently of bonuses. */
+export class BuyerDepositBelowMinimum extends Error {
+  override readonly name = "BuyerDepositBelowMinimum";
+
+  constructor(readonly minimumUsd: bigint) {
+    super(`Buyer has zero AntSeed balance; deposit principal must be at least ${minimumUsd} micro-USD (bonus excluded)`);
+  }
+}
 
 export type AntSeedFundingResult = {
   enabled: boolean;
@@ -89,7 +102,7 @@ export class AntSeedFundingVaultClient {
     };
   }
 
-  async depositForBuyerWithId(buyer: string, principalUsd: bigint, bonusUsd: bigint, id: string): Promise<AntSeedFundingResult> {
+  async depositForBuyerWithId(buyer: string, principalUsd: bigint, bonusUsd: bigint, id: string, requireMinimumPrincipal = false): Promise<AntSeedFundingResult> {
     const total = principalUsd + bonusUsd;
     logInfo("funding.bridge.deposit.start", {
       buyer: redactAddress(buyer),
@@ -123,6 +136,16 @@ export class AntSeedFundingVaultClient {
       return { enabled: true, buyer, amountUsd: total.toString() };
     }
     try {
+      if (requireMinimumPrincipal) {
+        const deposits = await this.getDepositsContract();
+        const [[available, reserved], minimum] = await Promise.all([
+          deposits.getBuyerBalance(buyer),
+          deposits.MIN_BUYER_DEPOSIT()
+        ]);
+        if (BigInt(available) + BigInt(reserved) === 0n && principalUsd < BigInt(minimum)) {
+          throw new BuyerDepositBelowMinimum(BigInt(minimum));
+        }
+      }
       const tx = await this.contract.depositForWithId(buyer, principalUsd, bonusUsd, id);
       logInfo("funding.bridge.deposit.submitted", {
         id,
@@ -152,15 +175,21 @@ export class AntSeedFundingVaultClient {
     }
   }
 
+  /** Resolves the current deposits contract from the operator's authoritative registry. */
+  private async getDepositsContract(): Promise<ethers.Contract> {
+    if (!this.contract) throw new Error("Funding bridge is disabled");
+    const registryAddress = await this.contract.registry();
+    const registry = new ethers.Contract(registryAddress, REGISTRY_ABI, this.contract.runner);
+    const depositsAddress = await registry.deposits();
+    return new ethers.Contract(depositsAddress, DEPOSITS_ABI, this.contract.runner);
+  }
+
   async isBuyerOperator(buyer: string): Promise<{ enabled: boolean; buyer: string; isOperator: boolean }> {
     const normalizedBuyer = buyer.toLowerCase();
     if (!this.contract) return { enabled: false, buyer: normalizedBuyer, isOperator: false };
 
     const operatorAddress = await this.contract.getAddress();
-    const registryAddress = await this.contract.registry();
-    const registry = new ethers.Contract(registryAddress, REGISTRY_ABI, this.contract.runner);
-    const depositsAddress = await registry.deposits();
-    const deposits = new ethers.Contract(depositsAddress, DEPOSITS_ABI, this.contract.runner);
+    const deposits = await this.getDepositsContract();
     const currentOperator = await deposits.getOperator(normalizedBuyer);
     return {
       enabled: true,

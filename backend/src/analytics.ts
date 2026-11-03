@@ -4,6 +4,7 @@ import { base, celo } from "viem/chains";
 import { decodeBuyerFromUserData } from "./celo-events.js";
 import { Env } from "./env.js";
 import { errorMessage, logError, logInfo, logWarn, redactAddress } from "./logging.js";
+import { notifySlackOnFailure, type FailureReporter } from "./http.js";
 
 type KV = Pick<KVNamespace, "get" | "put">;
 
@@ -71,6 +72,7 @@ type DailyAggregate = {
 };
 
 type AnalyticsConfig = {
+  reportFailure: FailureReporter;
   celoBlockscoutUrl: string;
   baseBlockscoutUrl: string;
   celoVaultAddress?: string;
@@ -128,8 +130,8 @@ const ZERO_DAILY = {
 export async function runAnalyticsAggregation(env: Env, runAt = new Date()): Promise<AnalyticsRunSummary> {
   const cfg = analyticsConfigFromEnv(env);
   const store = new KVAnalyticsStore(env.ANTSEED_KV);
-  const celoClient = await createChainClient(env.ANTSEED_KV, CELO_CHAIN_ID, celo, CELO_FALLBACK_RPCS);
-  const baseClient = await createChainClient(env.ANTSEED_KV, BASE_CHAIN_ID, base, BASE_FALLBACK_RPCS);
+  const celoClient = await createChainClient(env.ANTSEED_KV, CELO_CHAIN_ID, celo, CELO_FALLBACK_RPCS, cfg.reportFailure);
+  const baseClient = await createChainClient(env.ANTSEED_KV, BASE_CHAIN_ID, base, BASE_FALLBACK_RPCS, cfg.reportFailure);
   const runDay = dayFromDate(runAt);
   const state = (await store.getState()) ?? {
     updatedAt: runAt.toISOString()
@@ -320,6 +322,7 @@ export class KVAnalyticsStore {
 
 function analyticsConfigFromEnv(env: Env): AnalyticsConfig {
   return {
+    reportFailure: (details) => notifySlackOnFailure(env, details),
     celoBlockscoutUrl: env.CELO_BLOCKSCOUT_API_URL ?? "https://celo.blockscout.com/api",
     baseBlockscoutUrl: env.BASE_BLOCKSCOUT_API_URL ?? "https://base.blockscout.com/api",
     celoVaultAddress: env.CELO_VAULT_ADDRESS,
@@ -596,20 +599,12 @@ async function fetchStreamSnapshots(cfg: AnalyticsConfig, now: Date, dayStartUni
           flowRate: string;
           startedAtTimestamp: string;
           stoppedAtTimestamp: string | null;
-          stream: {
-            userData: string;
-          };
+          stream: { userData: string };
         }>;
       };
     };
-
-    // if error field is present, log and throw
     if (!json.data || json.errors) {
-      logError("analytics.streams.subgraph_error", {
-        url: cfg.superfluidSubgraphUrl,
-        body,
-        response: json
-      });
+      logError("analytics.streams.subgraph_error", { url: cfg.superfluidSubgraphUrl, body, response: json });
       throw new Error(`Superfluid subgraph error: ${errorMessage(json)}`);
     }
     const batch = json.data?.streamPeriods ?? [];
@@ -717,15 +712,15 @@ async function fetchLogsByRange(
   return results.flat();
 }
 
-async function createChainClient(kv: KV, chainId: number, chain: Chain, fallbackRpcs: string[]): Promise<PublicClient> {
-  const rpcUrls = await getChainRpcUrls(kv, chainId, fallbackRpcs);
+async function createChainClient(kv: KV, chainId: number, chain: Chain, fallbackRpcs: string[], reportFailure: FailureReporter): Promise<PublicClient> {
+  const rpcUrls = await getChainRpcUrls(kv, chainId, fallbackRpcs, reportFailure);
   return createPublicClient({
     chain,
     transport: fallback(rpcUrls.map((rpcUrl) => http(rpcUrl)))
   });
 }
 
-async function getChainRpcUrls(kv: KV, chainId: number, fallbackRpcs: string[]): Promise<string[]> {
+async function getChainRpcUrls(kv: KV, chainId: number, fallbackRpcs: string[], reportFailure: FailureReporter): Promise<string[]> {
   const key = `${RPCS_CACHE_PREFIX}${chainId}`;
   const cached = (await kv.get(key, "json")) as RpcCacheEntry | null;
   if (cached?.fetchedAt) {
@@ -751,6 +746,7 @@ async function getChainRpcUrls(kv: KV, chainId: number, fallbackRpcs: string[]):
       return fetchedUrls;
     }
   } catch (error) {
+    await reportFailure({ operation: "analytics.rpc.discovery", chain: chainId === CELO_CHAIN_ID ? "celo" : "base", recovered: true, error });
     logWarn("analytics.rpc.chainlist_failed", {
       chainId,
       message: errorMessage(error)

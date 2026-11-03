@@ -62,7 +62,7 @@ npm run build
 
 Optional secrets/config:
 
-- `SLACK_WEBHOOK_URL` - receives a notification when a fetch request ends with an uncaught exception. The payload includes the request method, path, raw body, and error message.
+- `SLACK_WEBHOOK_URL` - receives notifications for caught exceptions and blockchain transaction failures. HTTP notifications include the request body. See Failure Reporting below.
 - `MAX_BONUS_CAP_USD` - monthly per-root-account bonus cap (token units, 18 decimals), defaults to `100`.
 - `REGULAR_BONUS_BPS` - bonus basis points for deposits/non-stream sources, defaults to `1000` (10%).
 - `STREAMING_BONUS_BPS` - bonus basis points for stream sources, defaults to `2000` (20%).
@@ -70,6 +70,24 @@ Optional secrets/config:
 - `CELO_BLOCKSCOUT_API_URL` - Blockscout API URL for Celo logs (defaults to `https://celo.blockscout.com/api`).
 - `BASE_BLOCKSCOUT_API_URL` - Blockscout API URL for Base logs (defaults to `https://base.blockscout.com/api`).
 - `ANTSEED_CHANNELS_ADDRESS` - Antseed Channels contract address on Base used for AI credit usage metrics.
+
+## Failure Reporting
+
+With `SLACK_WEBHOOK_URL` configured, the Worker reports caught Base funding failures as well as request exceptions. This includes idempotency reads, minimum preflight reads, transaction submission/confirmation, cron stream processing, and background funding failures. Explicitly reverted Celo receipts are rejected and reported rather than accepted as an empty event list; missing receipts are classified separately as pending/not found.
+
+Exceptions caught by the existing oracle, subgraph, and analytics RPC-discovery handlers are also reported. Recovered exceptions are labeled `recovered_with_fallback`, not as confirmed transaction failures. No new parsing or validation rules are added for reporting: skipped malformed events, empty oracle results, non-positive oracle quotes, empty GoodID returns, and empty RPC-discovery results retain their prior behavior without alerts. Legitimate empty scans, unverified GoodID roots, missing operator consent, stream cooldowns, and duplicate deposit recovery do not generate alerts.
+
+Notifications contain operation, chain when known, outcome, an allowlisted error category, and validated credit entry/buyer/transaction identifiers when available. HTTP exception and funding-failure notifications also include the request method, full path, and body (truncated to 3,000 characters, as before). Request bodies may contain sensitive fields such as signatures, so restrict access to the Slack destination. Arbitrary remote error payloads are not forwarded. Propagated errors are deduplicated by error identity so nested handlers do not alert again. Separate funding attempts can each alert.
+
+Delivery is best effort with a five-second timeout. Failed webhook delivery is logged without recursion or a retry queue. A confirmation timeout is not proof of an on-chain revert. Wallet-only failures and user cancellations that never reach the Worker are not observable here.
+
+## Buyer Deposit Minimum
+
+Before submitting a new Base funding transaction for a direct G$ deposit, the Worker resolves the current AntSeed deposits contract through the funding operator's registry and reads the selected buyer's balance and `MIN_BUYER_DEPOSIT`. If available plus reserved balance is zero, the deposit **principal alone** must meet that minimum (currently $1 / 1,000,000 micro-USDC); bonus does not count. A payer's earlier deposits to another buyer do not waive this requirement. Buyers whose balance has been emptied need the minimum again; reserved-only positive balances still allow smaller top-ups.
+
+Insufficient principal or failed preflight reads prevent Base submission, retain the entry as failed funding, and generate an alert. Already-used deposit IDs bypass this guard so recovery never resubmits funding. Disabled bridging, zero-credit acknowledgements, and the existing stream funding policy are unchanged.
+
+This is a backend funding guard, **not a Celo payment preflight**: ingestion happens after the user has deposited G$ on Celo, so the Worker cannot prevent or undo that transfer. AntSeed remains authoritative if buyer balance or minimum changes between the read and Base execution. No contract or widget behavior changes are included.
 
 ## Config And Constants
 
