@@ -90,8 +90,8 @@ function buildOfflineAnalyticsFetchMock(options: {
     }
 
     if (url.host === "superfluid.test") {
-      const body = JSON.parse(String(init?.body)) as { variables: { skip: number } };
-      if (body.variables.skip > 0) {
+      const body = JSON.parse(String(init?.body)) as { variables: { skip?: number; lastId?: string } };
+      if ((body.variables.skip && body.variables.skip > 0) || (body.variables.lastId && body.variables.lastId.length > 0)) {
         return Response.json({ data: { streamPeriods: [] } });
       }
       return Response.json({ data: { streamPeriods: options.streamPeriods } });
@@ -318,6 +318,60 @@ test("runAnalyticsAggregation calculates streamed G$ for streams active since be
     assert.equal(analytics.daily[0].gdStreamedWei, expectedStreamed);
     assert.equal(analytics.global.gdStreamedWei, expectedStreamed);
     assert.equal(analytics.daily[0].uniqueGdBuyers, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+
+test("fetchStreamMetrics uses keyset pagination on id_gt and handles missing stream objects (#33 Finding 9)", async () => {
+  const now = new Date("2026-11-05T12:00:00.000Z");
+  const testEnv = env({
+    CELO_VAULT_ADDRESS: "0x4Dd0136b9aabD5823cf0F65d89e8fB882C660885",
+    CELO_GD_SUPERTOKEN_ADDRESS: "0x62B8B11039FcfE5aB0C56E502b1C372A3d2a9c7A",
+    CELO_BLOCKSCOUT_API_URL: "https://celo.blockscout.test/api",
+    BASE_BLOCKSCOUT_API_URL: "https://base.blockscout.test/api",
+    ANTSEED_CHANNELS_ADDRESS: "0xba66d3b4fbcf472f6f11d6f9f96aace96516f09d",
+    SUPERFLUID_SUBGRAPH_URL: "https://superfluid.test/subgraph"
+  });
+  const dayStartUnix = 1793836800;
+  const dayEndUnix = dayStartUnix + 86_399;
+  const baseMock = buildOfflineAnalyticsFetchMock({ dayStartUnix, dayEndUnix, streamPeriods: [] });
+  const queries: Array<{ query: string; variables: Record<string, unknown> }> = [];
+
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = (async (urlInput: string | URL | Request, init?: RequestInit) => {
+      const url = typeof urlInput === "string" ? new URL(urlInput) : urlInput instanceof URL ? urlInput : new URL(urlInput.url);
+      if (url.host === "superfluid.test") {
+        const parsed = JSON.parse(String(init?.body)) as { query: string; variables: Record<string, unknown> };
+        queries.push(parsed);
+        // Page 1 returns 1000 items (simulated with 1000 items to trigger next page)
+        if (parsed.variables.lastId === "") {
+          const batch = Array.from({ length: 1000 }, (_, i) => ({
+            id: `period:${i + 1}`,
+            sender: { id: "0x0000000000000000000000000000000000000abc" },
+            flowRate: "1",
+            startedAtTimestamp: String(dayStartUnix),
+            stoppedAtTimestamp: null,
+            // Test null-safety: stream is null or undefined on some periods
+            stream: i % 2 === 0 ? null : { userData: "0x" }
+          }));
+          return Response.json({ data: { streamPeriods: batch } });
+        }
+        // Page 2 returns empty, concluding pagination
+        return Response.json({ data: { streamPeriods: [] } });
+      }
+      return baseMock(urlInput, init);
+    }) as typeof fetch;
+
+    await runAnalyticsAggregation(testEnv, now);
+
+    assert.equal(queries.length, 2, "must paginate across 2 pages using keyset cursor");
+    assert.ok(queries[0].query.includes("id_gt: $lastId"), "query must use id_gt pagination");
+    assert.ok(queries[0].query.includes("orderBy: id"), "query must order by id");
+    assert.equal(queries[0].variables.lastId, "");
+    assert.equal(queries[1].variables.lastId, "period:1000", "second page must pass last entity id as cursor");
   } finally {
     globalThis.fetch = originalFetch;
   }

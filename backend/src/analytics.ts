@@ -537,25 +537,27 @@ async function fetchStreamSnapshots(cfg: AnalyticsConfig, now: Date, dayStartUni
 
   const snapshotsBySender = new Map<string, { buyerAddress?: string; flowRateWeiPerSecond: bigint; totalStreamedWei: bigint }>();
   const pageSize = 1000;
-  let skip = 0;
+  let lastId = "";
   const nowUnix = Math.floor(now.getTime() / 1000);
 
-  // get streams that are either active or stopped within the day window
+  // Keyset pagination on id_gt to avoid graph-node's hard 5,000-entity cap on skip.
   let body = {};
   while (true) {
     body = {
       query: `
-        query StreamPeriodsPage($receiver: String!, $token: String!, $daysago: BigInt!,$until:BigInt!, $first: Int!, $skip: Int!) {
+        query StreamPeriodsPage($receiver: String!, $token: String!, $daysago: BigInt!, $until: BigInt!, $lastId: String!, $first: Int!) {
           streamPeriods(
+            first: $first
+            orderBy: id
+            orderDirection: asc
             where: {
               or: [
-                { receiver: $receiver, token: $token, stoppedAtTimestamp: null, startedAtTimestamp_lte: $until },
-                { receiver: $receiver, token: $token, stoppedAtTimestamp_gt: $daysago, startedAtTimestamp_lte: $until }
+                { receiver: $receiver, token: $token, id_gt: $lastId, stoppedAtTimestamp: null, startedAtTimestamp_lte: $until },
+                { receiver: $receiver, token: $token, id_gt: $lastId, stoppedAtTimestamp_gt: $daysago, startedAtTimestamp_lte: $until }
               ]
             }
-            first: $first
-            skip: $skip
           ) {
+            id
             sender { id }
             flowRate
             startedAtTimestamp
@@ -571,8 +573,8 @@ async function fetchStreamSnapshots(cfg: AnalyticsConfig, now: Date, dayStartUni
         token: cfg.celoSuperTokenAddress,
         daysago: String(dayStartUnix),
         until: String(dayEndUnix),
-        first: pageSize,
-        skip
+        lastId,
+        first: pageSize
       }
     };
 
@@ -595,11 +597,12 @@ async function fetchStreamSnapshots(cfg: AnalyticsConfig, now: Date, dayStartUni
       errors?: Array<any>;
       data?: {
         streamPeriods?: Array<{
+          id?: string;
           sender: { id: string };
           flowRate: string;
           startedAtTimestamp: string;
           stoppedAtTimestamp: string | null;
-          stream: { userData: string };
+          stream?: { userData?: string } | null;
         }>;
       };
     };
@@ -613,7 +616,7 @@ async function fetchStreamSnapshots(cfg: AnalyticsConfig, now: Date, dayStartUni
       const flowRate = BigInt(period.flowRate || "0");
       const startedAt = parseNumberish(period.startedAtTimestamp || "0");
       const stoppedAt = period.stoppedAtTimestamp ? parseNumberish(period.stoppedAtTimestamp) : null;
-      const buyerAddress = decodeBuyerFromUserData(period.stream.userData);
+      const buyerAddress = decodeBuyerFromUserData(period.stream?.userData);
 
       // intersect period with the day window to get seconds streamed today
       const effectiveStart = Math.max(startedAt, dayStartUnix);
@@ -636,7 +639,8 @@ async function fetchStreamSnapshots(cfg: AnalyticsConfig, now: Date, dayStartUni
     }
 
     if (batch.length < pageSize) break;
-    skip += pageSize;
+    lastId = batch[batch.length - 1].id ?? "";
+    if (!lastId) break;
   }
 
   return [...snapshotsBySender.entries()].map(([sender, value]) => ({
