@@ -332,3 +332,177 @@ test("log redaction masks addresses and transaction hashes (#33 Finding 12)", ()
   assert.equal(redactAddress(undefined), undefined);
   assert.equal(redactHash(undefined), undefined);
 });
+
+test("analytics retries on HTTP 429/503 for Superfluid, Explorer, and Chainlist then succeeds (#33 Finding 10)", { concurrency: false }, async () => {
+  const originalFetch = globalThis.fetch;
+  const now = new Date("2026-07-24T12:00:00.000Z");
+  const dayStartUnix = Math.floor(new Date("2026-07-24T00:00:00.000Z").getTime() / 1000);
+  const dayEndUnix = dayStartUnix + 86_399;
+
+  let chainlistCalls = 0;
+  let explorerCalls = 0;
+  let superfluidCalls = 0;
+
+  const baseOffline = buildOfflineAnalyticsFetchMock({
+    dayStartUnix,
+    dayEndUnix,
+    streamPeriods: [
+      {
+        sender: { id: "0x0000000000000000000000000000000000000abc" },
+        flowRate: "1",
+        startedAtTimestamp: String(dayStartUnix),
+        stoppedAtTimestamp: null,
+        stream: { userData: "0x" }
+      }
+    ]
+  });
+
+  const testEnv = env({
+    CELO_VAULT_ADDRESS: "0x4Dd0136b9aabD5823cf0F65d89e8fB882C660885",
+    CELO_GD_SUPERTOKEN_ADDRESS: "0x62B8B11039FcfE5aB0C56E502b1C372A3d2a9c7A",
+    CELO_BLOCKSCOUT_API_URL: "https://celo.blockscout.test/api",
+    BASE_BLOCKSCOUT_API_URL: "https://base.blockscout.test/api",
+    ANTSEED_CHANNELS_ADDRESS: "0xba66d3b4fbcf472f6f11d6f9f96aace96516f09d",
+    SUPERFLUID_SUBGRAPH_URL: "https://superfluid.test/subgraph"
+  });
+
+  try {
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === "string" ? new URL(input) : input instanceof URL ? input : new URL(input.url);
+
+      if (url.host === "chainlist.org") {
+        chainlistCalls += 1;
+        if (chainlistCalls === 1) {
+          return new Response("Too Many Requests", { status: 429 });
+        }
+      }
+
+      if (url.host === "celo.blockscout.test" && url.searchParams.get("action") === "getblocknobytime") {
+        explorerCalls += 1;
+        if (explorerCalls === 1) {
+          return new Response("Service Unavailable", { status: 503 });
+        }
+      }
+
+      if (url.host === "superfluid.test") {
+        superfluidCalls += 1;
+        if (superfluidCalls === 1) {
+          return new Response("Rate limit reached", { status: 429 });
+        }
+      }
+
+      return baseOffline(input, init);
+    }) as typeof fetch;
+
+    await runAnalyticsAggregation(testEnv, now);
+
+    assert.equal(chainlistCalls, 3, "Chainlist should retry Celo after initial 429 then fetch Base");
+    assert.equal(explorerCalls >= 2, true, "Explorer should retry after initial 503");
+    assert.equal(superfluidCalls >= 2, true, "Superfluid should retry after initial 429");
+
+    const analytics = await getAnalyticsWindow(testEnv, 1, now);
+    assert.equal(analytics.daily[0].uniqueGdBuyers, 1);
+    assert.ok(analytics.global.updatedAt);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("analytics bounded retry exhaustion on persistent 500 leaves state unchanged (#33 Finding 10)", { concurrency: false }, async () => {
+  const originalFetch = globalThis.fetch;
+  const now = new Date("2026-07-24T12:00:00.000Z");
+  const dayStartUnix = Math.floor(new Date("2026-07-24T00:00:00.000Z").getTime() / 1000);
+  const dayEndUnix = dayStartUnix + 86_399;
+
+  let superfluidAttempts = 0;
+  const baseOffline = buildOfflineAnalyticsFetchMock({
+    dayStartUnix,
+    dayEndUnix,
+    streamPeriods: []
+  });
+
+  const testEnv = env({
+    CELO_VAULT_ADDRESS: "0x4Dd0136b9aabD5823cf0F65d89e8fB882C660885",
+    CELO_GD_SUPERTOKEN_ADDRESS: "0x62B8B11039FcfE5aB0C56E502b1C372A3d2a9c7A",
+    CELO_BLOCKSCOUT_API_URL: "https://celo.blockscout.test/api",
+    BASE_BLOCKSCOUT_API_URL: "https://base.blockscout.test/api",
+    ANTSEED_CHANNELS_ADDRESS: "0xba66d3b4fbcf472f6f11d6f9f96aace96516f09d",
+    SUPERFLUID_SUBGRAPH_URL: "https://superfluid.test/subgraph"
+  });
+
+  try {
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === "string" ? new URL(input) : input instanceof URL ? input : new URL(input.url);
+
+      if (url.host === "superfluid.test") {
+        superfluidAttempts += 1;
+        return new Response("Internal Server Error", { status: 500 });
+      }
+
+      return baseOffline(input, init);
+    }) as typeof fetch;
+
+    await assert.rejects(
+      runAnalyticsAggregation(testEnv, now),
+      /Superfluid subgraph HTTP 500/
+    );
+
+    // Initial call + 3 retries = 4 attempts total
+    assert.equal(superfluidAttempts, 4, "Should exhaust exactly 1 initial + 3 retries");
+
+    // State remains unpersisted on failure
+    const savedState = await testEnv.ANTSEED_KV.get("analytics:state");
+    assert.equal(savedState, null, "Analytics state must remain null on failed aggregation");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("analytics falls back to default RPCs when Chainlist continuously fails (#33 Finding 10)", { concurrency: false }, async () => {
+  const originalFetch = globalThis.fetch;
+  const now = new Date("2026-07-24T12:00:00.000Z");
+  const dayStartUnix = Math.floor(new Date("2026-07-24T00:00:00.000Z").getTime() / 1000);
+  const dayEndUnix = dayStartUnix + 86_399;
+
+  let chainlistCalls = 0;
+  const baseOffline = buildOfflineAnalyticsFetchMock({
+    dayStartUnix,
+    dayEndUnix,
+    streamPeriods: []
+  });
+
+  const testEnv = env({
+    CELO_VAULT_ADDRESS: "0x4Dd0136b9aabD5823cf0F65d89e8fB882C660885",
+    CELO_GD_SUPERTOKEN_ADDRESS: "0x62B8B11039FcfE5aB0C56E502b1C372A3d2a9c7A",
+    CELO_BLOCKSCOUT_API_URL: "https://celo.blockscout.test/api",
+    BASE_BLOCKSCOUT_API_URL: "https://base.blockscout.test/api",
+    ANTSEED_CHANNELS_ADDRESS: "0xba66d3b4fbcf472f6f11d6f9f96aace96516f09d",
+    SUPERFLUID_SUBGRAPH_URL: "https://superfluid.test/subgraph"
+  });
+
+  try {
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === "string" ? new URL(input) : input instanceof URL ? input : new URL(input.url);
+
+      if (url.host === "chainlist.org") {
+        chainlistCalls += 1;
+        return new Response("Bad Gateway", { status: 502 });
+      }
+
+      if (["forno.celo.org", "rpc.ankr.com", "mainnet.base.org"].includes(url.host)) {
+        return baseOffline(url.host === "mainnet.base.org" ? "https://base.rpc.test" : "https://celo.rpc.test", init);
+      }
+
+      return baseOffline(input, init);
+    }) as typeof fetch;
+
+    await runAnalyticsAggregation(testEnv, now);
+
+    assert.equal(chainlistCalls >= 4, true, "Chainlist should retry before falling back");
+
+    const analytics = await getAnalyticsWindow(testEnv, 1, now);
+    assert.ok(analytics.daily.length > 0, "Aggregation should succeed using fallback RPCs");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
