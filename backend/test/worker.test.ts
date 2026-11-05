@@ -2227,3 +2227,15 @@ test("scheduled run leaves state alone when the subgraph is unavailable", { conc
   }
   assert.equal(await kv.get("streams:closed-periods-cursor"), "1000");
 });
+
+
+test("configFromEnv scales MAX_BONUS_CAP_USD to 6-decimal micro-USD units", () => {
+  const defaultCfg = configFromEnv({ ANTSEED_KV: new MemoryKV() as never });
+  assert.equal(defaultCfg.MAX_BONUS_CAP_USD, 100_000_000n);
+
+  const customCfg = configFromEnv({
+    ANTSEED_KV: new MemoryKV() as never,
+    MAX_BONUS_CAP_USD: "250"
+  });
+  assert.equal(customCfg.MAX_BONUS_CAP_USD, 250_000_000n);
+});
