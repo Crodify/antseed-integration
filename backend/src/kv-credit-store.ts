@@ -249,11 +249,31 @@ export class KVCreditStore {
     return true;
   }
 
-  async getGdCredits(account: string): Promise<GdCreditEntry[]> {
+  async getGdCredits(account: string, options?: { limit?: number; offset?: number; all?: boolean }): Promise<GdCreditEntry[]> {
     const normalized = normalizeAccount(account);
     const ids = (await this.getJson<string[]>(`${USER_GD_CREDITS_PREFIX}${normalized}`)) ?? [];
-    const entries = await Promise.all(ids.map((id) => this.getJson<GdCreditEntry>(`${GD_CREDIT_PREFIX}${id}`)));
+    const targetIds = options?.all
+      ? ids
+      : options?.limit !== undefined
+      ? ids.slice(options.offset ?? 0, (options.offset ?? 0) + options.limit)
+      : ids.length > 500
+      ? [...ids].reverse().slice(0, 500)
+      : ids;
+    const entries = await Promise.all(targetIds.map((id) => this.getJson<GdCreditEntry>(`${GD_CREDIT_PREFIX}${id}`)));
     return entries.filter((item): item is GdCreditEntry => Boolean(item));
+  }
+
+  /**
+   * Returns pending or failed funding credits for an account. Bounded to recent entries
+   * to respect Workers KV invocation limits on high-volume accounts.
+   */
+  async getOutstandingCredits(account: string): Promise<GdCreditEntry[]> {
+    const normalized = normalizeAccount(account);
+    const ids = (await this.getJson<string[]>(`${USER_GD_CREDITS_PREFIX}${normalized}`)) ?? [];
+    if (ids.length === 0) return [];
+    const candidates = ids.length > 200 ? [...ids].reverse().slice(0, 200) : ids;
+    const entries = await Promise.all(candidates.map((id) => this.getJson<GdCreditEntry>(`${GD_CREDIT_PREFIX}${id}`)));
+    return entries.filter((item): item is GdCreditEntry => Boolean(item)).filter((item) => item.fundingStatus === "failed" || item.fundingStatus === "pending");
   }
 
   async getGdCreditHistory(
@@ -267,7 +287,31 @@ export class KVCreditStore {
       to?: string;
     }
   ): Promise<{ items: GdCreditEntry[]; total: number; limit: number; offset: number; hasMore: boolean }> {
-    let entries = await this.getGdCredits(account);
+    const normalized = normalizeAccount(account);
+    const ids = (await this.getJson<string[]>(`${USER_GD_CREDITS_PREFIX}${normalized}`)) ?? [];
+    const total = ids.length;
+
+    // Fast bounded path: when no filters are applied, slice the ID index before fetching from KV.
+    // IDs are stored chronologically; history is displayed newest-first (createdAt desc).
+    if (!options.source && !options.fundingStatus && !options.from && !options.to) {
+      const pageIds = [...ids].reverse().slice(options.offset, options.offset + options.limit);
+      const entries = await Promise.all(pageIds.map((id) => this.getJson<GdCreditEntry>(`${GD_CREDIT_PREFIX}${id}`)));
+      const items = entries.filter((item): item is GdCreditEntry => Boolean(item));
+      items.sort((a, b) => {
+        const byCreated = b.createdAt.localeCompare(a.createdAt);
+        if (byCreated !== 0) return byCreated;
+        return b.id.localeCompare(a.id);
+      });
+      return {
+        items,
+        total,
+        limit: options.limit,
+        offset: options.offset,
+        hasMore: options.offset + options.limit < total
+      };
+    }
+
+    let entries = await this.getGdCredits(account, { all: true });
     entries = [...entries].sort((a, b) => {
       const byCreated = b.createdAt.localeCompare(a.createdAt);
       if (byCreated !== 0) return byCreated;
@@ -287,14 +331,14 @@ export class KVCreditStore {
       const toMs = Date.parse(options.to);
       entries = entries.filter((entry) => Date.parse(entry.createdAt) <= toMs);
     }
-    const total = entries.length;
+    const filteredTotal = entries.length;
     const items = entries.slice(options.offset, options.offset + options.limit);
     return {
       items,
-      total,
+      total: filteredTotal,
       limit: options.limit,
       offset: options.offset,
-      hasMore: options.offset + options.limit < total
+      hasMore: options.offset + options.limit < filteredTotal
     };
   }
 

@@ -394,8 +394,10 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
   const outstandingMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/outstanding$/);
   if (request.method === "GET" && outstandingMatch) {
     const account = decodeURIComponent(outstandingMatch[1]);
-    const [profile, gdCredits] = await Promise.all([store.getUser(account), store.getGdCredits(account)]);
-    const outstandingFundingCredits = gdCredits.filter((entry) => entry.fundingStatus === "failed" || entry.fundingStatus === "pending");
+    const [profile, outstandingFundingCredits] = await Promise.all([
+      store.getUser(account),
+      store.getOutstandingCredits(account)
+    ]);
     return json({
       account: profile.account,
       outstandingFundingUsd: profile.totalOutstandingFundingUsd,

@@ -567,10 +567,14 @@ test("credit-id index retains all entries beyond 500 without truncation (#33 Fin
     });
   }
 
-  const allCredits = await store.getGdCredits(account);
+  const allCredits = await store.getGdCredits(account, { all: true });
   assert.equal(allCredits.length, 520, "must retain all 520 entries without dropping oldest");
   assert.equal(allCredits[0].id, "deposit:0", "oldest entry must be preserved");
   assert.equal(allCredits[519].id, "deposit:519", "newest entry must be preserved");
+
+  // Default bounded getGdCredits caps at 500 to protect Workers KV limits
+  const boundedCredits = await store.getGdCredits(account);
+  assert.equal(boundedCredits.length, 500, "unbounded caller is safely capped at 500 entries");
 
   const history = await store.getGdCreditHistory(account, { limit: 100, offset: 0 });
   assert.equal(history.total, 520, "history total must report full count");
@@ -580,4 +584,8 @@ test("credit-id index retains all entries beyond 500 without truncation (#33 Fin
   const tailPage = await store.getGdCreditHistory(account, { limit: 100, offset: 500 });
   assert.equal(tailPage.items.length, 20, "tail entries beyond 500 must remain accessible");
   assert.equal(tailPage.hasMore, false);
+
+  // Outstanding credits reader scans recent candidates safely
+  const outstanding = await store.getOutstandingCredits(account);
+  assert.equal(outstanding.length, 200, "all 520 entries are funded; recent 200 scanned safely");
 });
