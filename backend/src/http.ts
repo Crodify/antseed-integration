@@ -61,7 +61,9 @@ export async function notifySlackOnFailure(env: Pick<Env, "SLACK_WEBHOOK_URL">, 
 export async function parseJson(request: Request): Promise<unknown> {
   const contentType = request.headers.get("content-type") ?? "";
   if (!contentType.includes("application/json")) throw new Error("content-type must be application/json");
-  return request.json();
+  const text = await request.text();
+  if (!text || !text.trim()) return {};
+  return JSON.parse(text);
 }
 
 export async function notifySlackOnRequestError(env: Env, details: { method: string; path: string; body: string | undefined; message: string; error?: unknown }): Promise<void> {

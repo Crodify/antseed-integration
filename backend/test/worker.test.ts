@@ -1155,6 +1155,18 @@ test("POST /v1/channels/:channelId/close rejects invalid signature format", asyn
   assert.equal(res.status, 400);
 });
 
+test("POST /v1/channels/:channelId/close rejects empty body with 400", async () => {
+  const res = await worker.fetch(
+    new Request(`https://worker.test/v1/channels/${CHANNEL_ID}/close`, {
+      method: "POST",
+      headers: { "content-type": "application/json" }
+    }),
+    env(),
+    makeExecutionContext()
+  );
+  assert.equal(res.status, 400);
+});
+
 test("POST /v1/accounts/:account/operator-consent returns 400 on missing body fields", async () => {
   const buyer = "0x0000000000000000000000000000000000000abc";
   const res = await worker.fetch(

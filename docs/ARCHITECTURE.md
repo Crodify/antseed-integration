@@ -107,13 +107,13 @@ The backend is a Cloudflare Worker managed by Wrangler. Its current scope is G$ 
 
 **Channel close** (`POST /v1/channels/:channelId/close`):
 
-- optional buyer EIP-712 `RequestClose` (`nonce`, `signature`) or operator-as-owner when unsigned
-- calls `AntseedBuyerOperator.requestClose(channelId, …)`
+- buyer EIP-712 `RequestClose` (`nonce`, `signature`)
+- calls `AntseedBuyerOperator.requestClose(channelId, nonce, buyerSig)`
 
 **Channel withdraw** (`POST /v1/channels/:channelId/withdraw`):
 
-- optional buyer EIP-712 `WithdrawChannel` (`nonce`, `signature`) or operator-as-owner when unsigned
-- calls `AntseedBuyerOperator.withdrawChannel(channelId, …)`
+- buyer EIP-712 `WithdrawChannel` (`nonce`, `signature`)
+- calls `AntseedBuyerOperator.withdrawChannel(channelId, nonce, buyerSig)`
 
 **Funding path** (`fundCredit`):
 
