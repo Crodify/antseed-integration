@@ -75,11 +75,8 @@ const CreditHistoryQuerySchema = z.object({
     .optional()
 });
 const ChannelOpSchema = z.object({
-  nonce: z.string().regex(/^\d+$/).optional(),
-  signature: z
-    .string()
-    .regex(/^0x[0-9a-fA-F]+$/)
-    .optional()
+  nonce: z.string().regex(/^\d+$/),
+  signature: z.string().regex(/^0x[0-9a-fA-F]+$/)
 });
 const AnalyticsQuerySchema = z.object({
   days: z.coerce.number().int().min(1).max(365).default(30)
@@ -471,17 +468,17 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
   if (request.method === "POST" && channelOpMatch) {
     const channelId = channelOpMatch[1];
     const action = channelOpMatch[2];
-    const body = request.headers.get("content-length") !== "0" ? await parseJson(request) : {};
+    const body = await parseJson(request);
     const parsed = ChannelOpSchema.safeParse(body);
     if (!parsed.success) return json({ error: parsed.error.flatten() }, 400);
     const { nonce, signature } = parsed.data;
     logInfo("channel.request", {
       action,
       channelId: redactHash(channelId),
-      hasNonce: nonce !== undefined,
-      hasSignature: Boolean(signature)
+      hasNonce: true,
+      hasSignature: true
     });
-    const parsedNonce = nonce === undefined ? undefined : BigInt(nonce);
+    const parsedNonce = BigInt(nonce);
     const bridge =
       action === "close"
         ? await antseedFundingVault.requestClose(channelId, parsedNonce, signature)

@@ -211,16 +211,16 @@ export class AntSeedFundingVaultClient {
     return { enabled: true, txHash: receipt?.hash };
   }
 
-  async requestClose(channelId: string, nonce?: bigint, buyerSig?: string): Promise<{ enabled: boolean; txHash?: string }> {
+  async requestClose(channelId: string, nonce: bigint, buyerSig: string): Promise<{ enabled: boolean; txHash?: string }> {
     if (!this.contract) return { enabled: false };
-    const tx = await this.contract.requestClose(channelId, nonce ?? 0n, buyerSig ?? "0x");
+    const tx = await this.contract.requestClose(channelId, nonce, buyerSig);
     const receipt = await tx.wait();
     return { enabled: true, txHash: receipt?.hash };
   }
 
-  async withdrawFromChannel(channelId: string, nonce?: bigint, buyerSig?: string): Promise<{ enabled: boolean; txHash?: string }> {
+  async withdrawFromChannel(channelId: string, nonce: bigint, buyerSig: string): Promise<{ enabled: boolean; txHash?: string }> {
     if (!this.contract) return { enabled: false };
-    const tx = await this.contract.withdrawChannel(channelId, nonce ?? 0n, buyerSig ?? "0x");
+    const tx = await this.contract.withdrawChannel(channelId, nonce, buyerSig);
     const receipt = await tx.wait();
     return { enabled: true, txHash: receipt?.hash };
   }

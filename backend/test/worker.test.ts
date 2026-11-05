@@ -1082,12 +1082,38 @@ test("analytics refresh collects logs beyond the explorer 1000-result cap", { co
 
 const CHANNEL_ID = `0x${"a".repeat(64)}`;
 
-test("POST /v1/channels/:channelId/close returns enabled:false when vault not configured", async () => {
+test("POST /v1/channels/:channelId/close returns 400 when body is missing required fields", async () => {
   const res = await worker.fetch(
     new Request(`https://worker.test/v1/channels/${CHANNEL_ID}/close`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({})
+    }),
+    env(),
+    makeExecutionContext()
+  );
+  assert.equal(res.status, 400);
+});
+
+test("POST /v1/channels/:channelId/withdraw returns 400 when body is missing required fields", async () => {
+  const res = await worker.fetch(
+    new Request(`https://worker.test/v1/channels/${CHANNEL_ID}/withdraw`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({})
+    }),
+    env(),
+    makeExecutionContext()
+  );
+  assert.equal(res.status, 400);
+});
+
+test("POST /v1/channels/:channelId/close with valid sig and nonce returns enabled:false when vault not configured", async () => {
+  const res = await worker.fetch(
+    new Request(`https://worker.test/v1/channels/${CHANNEL_ID}/close`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ nonce: "0", signature: `0x${"b".repeat(130)}` })
     }),
     env(),
     makeExecutionContext()
@@ -1099,12 +1125,12 @@ test("POST /v1/channels/:channelId/close returns enabled:false when vault not co
   assert.equal(body.bridge.enabled, false);
 });
 
-test("POST /v1/channels/:channelId/withdraw returns enabled:false when vault not configured", async () => {
+test("POST /v1/channels/:channelId/withdraw with valid sig and nonce returns enabled:false when vault not configured", async () => {
   const res = await worker.fetch(
     new Request(`https://worker.test/v1/channels/${CHANNEL_ID}/withdraw`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({})
+      body: JSON.stringify({ nonce: "0", signature: `0x${"b".repeat(130)}` })
     }),
     env(),
     makeExecutionContext()
@@ -1116,27 +1142,12 @@ test("POST /v1/channels/:channelId/withdraw returns enabled:false when vault not
   assert.equal(body.bridge.enabled, false);
 });
 
-test("POST /v1/channels/:channelId/close with optional sig fields passes validation", async () => {
-  const res = await worker.fetch(
-    new Request(`https://worker.test/v1/channels/${CHANNEL_ID}/close`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ nonce: "0", signature: `0x${"b".repeat(130)}` })
-    }),
-    env(),
-    makeExecutionContext()
-  );
-  assert.equal(res.status, 200);
-  const body = (await res.json()) as { bridge: { enabled: boolean } };
-  assert.equal(body.bridge.enabled, false);
-});
-
 test("POST /v1/channels/:channelId/close rejects invalid signature format", async () => {
   const res = await worker.fetch(
     new Request(`https://worker.test/v1/channels/${CHANNEL_ID}/close`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ signature: "not-a-hex-sig" })
+      body: JSON.stringify({ nonce: "0", signature: "not-a-hex-sig" })
     }),
     env(),
     makeExecutionContext()
