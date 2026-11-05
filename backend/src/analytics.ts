@@ -164,7 +164,8 @@ export async function runAnalyticsAggregation(env: Env, runAt = new Date()): Pro
   await store.replaceDaily(currentDate, dailyRecord, [...aggregate.gdBuyers], [...aggregate.creditUsers]);
 
   const latestState = (await store.getState()) ?? state;
-  if (latestState?.finalizedThroughDate && currentDate <= latestState.finalizedThroughDate && !oldDaily.missing) {
+  const isQueuedSkipped = Boolean(latestState?.skippedDates?.includes(currentDate));
+  if (latestState?.finalizedThroughDate && currentDate <= latestState.finalizedThroughDate && !oldDaily.missing && !isQueuedSkipped) {
     const currentGlobal = await store.getGlobal();
     const updatedGlobal = addDailyToGlobal(
       subtractDailyFromGlobal(currentGlobal, oldDaily, windowEnd.toISOString()),
@@ -230,16 +231,40 @@ export async function getAnalyticsWindow(env: Env, days = 30, now = new Date()):
     store.getState()
   ]);
 
-  let global = persistedGlobal;
-  const finalizedThroughDate = state?.finalizedThroughDate;
-  const skippedSet = new Set(state?.skippedDates ?? []);
+  const outstandingDatesSet = new Set<string>();
+  if (state?.finalizedThroughDate) {
+    let cursor = nextDate(state.finalizedThroughDate);
+    while (cursor && cursor <= currentDate) {
+      outstandingDatesSet.add(cursor);
+      cursor = nextDate(cursor);
+    }
+  } else {
+    for (const d of dates) outstandingDatesSet.add(d);
+  }
+  for (const skipped of state?.skippedDates ?? []) {
+    if (skipped <= currentDate) {
+      outstandingDatesSet.add(skipped);
+    }
+  }
 
+  const fetchedMap = new Map<string, AnalyticsDailyRecord>();
   for (const day of daily) {
-    if (!day.missing) {
-      const isUnfinalized = !finalizedThroughDate || day.date > finalizedThroughDate || skippedSet.has(day.date);
-      if (isUnfinalized) {
-        global = addDailyToGlobal(global, day, now.toISOString());
-      }
+    fetchedMap.set(day.date, day);
+  }
+
+  const missingDatesToFetch = [...outstandingDatesSet].filter((d) => !fetchedMap.has(d));
+  if (missingDatesToFetch.length > 0) {
+    const extraRecords = await fetchDailyRecordsConcurrently(store, missingDatesToFetch);
+    for (const record of extraRecords) {
+      fetchedMap.set(record.date, record);
+    }
+  }
+
+  let global = persistedGlobal;
+  for (const date of outstandingDatesSet) {
+    const record = fetchedMap.get(date);
+    if (record && !record.missing) {
+      global = addDailyToGlobal(global, record, now.toISOString());
     }
   }
 
@@ -366,6 +391,7 @@ async function finalizeClosedDays(store: KVAnalyticsStore, state: AnalyticsState
 
   let global = await store.getGlobal();
   const skippedDates = [...(state.skippedDates ?? [])];
+  const reconciledInRepair = new Set<string>();
 
   // 1. Attempt to reconcile any previously skipped missing dates that are now available
   if (skippedDates.length > 0) {
@@ -376,6 +402,7 @@ async function finalizeClosedDays(store: KVAnalyticsStore, state: AnalyticsState
         if (!day.missing) {
           global = addDailyToGlobal(global, day, now.toISOString());
           finalizedDates.push(skippedDate);
+          reconciledInRepair.add(skippedDate);
         } else {
           remainingSkipped.push(skippedDate);
         }
@@ -404,6 +431,13 @@ async function finalizeClosedDays(store: KVAnalyticsStore, state: AnalyticsState
   let lastFinalized = state.finalizedThroughDate;
 
   while (cursor <= yesterday) {
+    if (reconciledInRepair.has(cursor)) {
+      lastFinalized = cursor;
+      const next = nextDate(cursor);
+      if (!next) break;
+      cursor = next;
+      continue;
+    }
     const day = await store.getDaily(cursor);
     if (day.missing) {
       logWarn("analytics.finalize.skipped", {
