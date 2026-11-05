@@ -17,6 +17,7 @@ type StreamSnapshot = {
 
 type AnalyticsState = {
   finalizedThroughDate?: string;
+  skippedDates?: string[];
   updatedAt: string;
 };
 
@@ -43,6 +44,7 @@ export type AnalyticsGlobalTotals = {
 export type AnalyticsLastRun = {
   currentDate: string;
   finalizedThroughDate?: string;
+  skippedDates?: string[];
   updatedAt: string;
 };
 
@@ -157,15 +159,28 @@ export async function runAnalyticsAggregation(env: Env, runAt = new Date()): Pro
   const baseMetrics = await collectBaseDayMetrics(cfg, baseClient, dayWindow, aggregate, knownBuyers);
   logInfo("building dialy reocrd....");
 
+  const oldDaily = await store.getDaily(currentDate);
   const dailyRecord = buildDailyRecord(currentDate, aggregate, windowEnd);
   await store.replaceDaily(currentDate, dailyRecord, [...aggregate.gdBuyers], [...aggregate.creditUsers]);
-  const latestState = await store.getState();
+
+  const latestState = (await store.getState()) ?? state;
+  if (latestState?.finalizedThroughDate && currentDate <= latestState.finalizedThroughDate && !oldDaily.missing) {
+    const currentGlobal = await store.getGlobal();
+    const updatedGlobal = addDailyToGlobal(
+      subtractDailyFromGlobal(currentGlobal, oldDaily, windowEnd.toISOString()),
+      dailyRecord,
+      windowEnd.toISOString()
+    );
+    await store.putGlobal(updatedGlobal);
+  }
+
   await store.putState({
     finalizedThroughDate: latestState?.finalizedThroughDate,
+    skippedDates: latestState?.skippedDates,
     updatedAt: windowEnd.toISOString()
   });
 
-  const finalizedDates = await finalizeClosedDays(store, state, runDay, runAt);
+  const finalizedDates = await finalizeClosedDays(store, latestState, runDay, runAt);
   logInfo("analytics.sync.end", {
     currentDate,
     finalizedDates,
@@ -215,9 +230,19 @@ export async function getAnalyticsWindow(env: Env, days = 30, now = new Date()):
     store.getState()
   ]);
 
-  // The last fetched day is currentDate's record, so no need to re-read it from KV.
-  const today = daily[daily.length - 1];
-  const global = addDailyToGlobal(persistedGlobal, today, now.toISOString());
+  let global = persistedGlobal;
+  const finalizedThroughDate = state?.finalizedThroughDate;
+  const skippedSet = new Set(state?.skippedDates ?? []);
+
+  for (const day of daily) {
+    if (!day.missing) {
+      const isUnfinalized = !finalizedThroughDate || day.date > finalizedThroughDate || skippedSet.has(day.date);
+      if (isUnfinalized) {
+        global = addDailyToGlobal(global, day, now.toISOString());
+      }
+    }
+  }
+
   const resolvedState = state ?? { updatedAt: now.toISOString() };
 
   return {
@@ -227,6 +252,7 @@ export async function getAnalyticsWindow(env: Env, days = 30, now = new Date()):
     lastRun: {
       currentDate,
       finalizedThroughDate: resolvedState.finalizedThroughDate,
+      skippedDates: resolvedState.skippedDates,
       updatedAt: resolvedState.updatedAt
     }
   };
@@ -338,39 +364,73 @@ async function finalizeClosedDays(store: KVAnalyticsStore, state: AnalyticsState
   const yesterday = previousDate(currentDate);
   if (!yesterday) return finalizedDates;
 
-  const startDate = state.finalizedThroughDate ? nextDate(state.finalizedThroughDate) : yesterday;
-  if (!startDate) {
-    return finalizedDates;
-  }
-
-  if (startDate > yesterday) {
-    return finalizedDates;
-  }
-
   let global = await store.getGlobal();
+  const skippedDates = [...(state.skippedDates ?? [])];
+
+  // 1. Attempt to reconcile any previously skipped missing dates that are now available
+  if (skippedDates.length > 0) {
+    const remainingSkipped: string[] = [];
+    for (const skippedDate of skippedDates) {
+      if (skippedDate <= yesterday) {
+        const day = await store.getDaily(skippedDate);
+        if (!day.missing) {
+          global = addDailyToGlobal(global, day, now.toISOString());
+          finalizedDates.push(skippedDate);
+        } else {
+          remainingSkipped.push(skippedDate);
+        }
+      } else {
+        remainingSkipped.push(skippedDate);
+      }
+    }
+    skippedDates.length = 0;
+    skippedDates.push(...remainingSkipped);
+  }
+
+  const startDate = state.finalizedThroughDate ? nextDate(state.finalizedThroughDate) : yesterday;
+  if (!startDate || startDate > yesterday) {
+    if (finalizedDates.length > 0) {
+      await store.putGlobal(global);
+      await store.putState({
+        finalizedThroughDate: state.finalizedThroughDate,
+        skippedDates: skippedDates.length > 0 ? skippedDates.sort() : undefined,
+        updatedAt: now.toISOString()
+      });
+    }
+    return finalizedDates;
+  }
+
   let cursor = startDate;
+  let lastFinalized = state.finalizedThroughDate;
+
   while (cursor <= yesterday) {
     const day = await store.getDaily(cursor);
-    //dont finalize if a day is missing
     if (day.missing) {
-      // log warning
       logWarn("analytics.finalize.skipped", {
         reason: "missing_daily_record",
         date: cursor
       });
-      break;
+      if (!skippedDates.includes(cursor)) {
+        skippedDates.push(cursor);
+      }
+      const next = nextDate(cursor);
+      if (!next) break;
+      cursor = next;
+      continue;
     }
     global = addDailyToGlobal(global, day, now.toISOString());
     finalizedDates.push(cursor);
+    lastFinalized = cursor;
     const next = nextDate(cursor);
     if (!next) break;
     cursor = next;
   }
 
   await store.putGlobal(global);
-  const finalizedThroughDate = finalizedDates.length > 0 ? finalizedDates[finalizedDates.length - 1] : state.finalizedThroughDate;
+  const finalizedThroughDate = lastFinalized ?? state.finalizedThroughDate;
   await store.putState({
     finalizedThroughDate,
+    skippedDates: skippedDates.length > 0 ? skippedDates.sort() : undefined,
     updatedAt: now.toISOString()
   });
   return finalizedDates;
@@ -521,6 +581,20 @@ function addDailyToGlobal(global: AnalyticsGlobalTotals, day: AnalyticsDailyReco
     gdStreamedWei: (BigInt(global.gdStreamedWei) + BigInt(day.gdStreamedWei)).toString(),
     aiCreditsUsedWei: (BigInt(global.aiCreditsUsedWei) + BigInt(day.aiCreditsUsedWei)).toString(),
     gdTotalFlowRateWeiPerSecond: BigInt(day.gdTotalFlowRateWeiPerSecond).toString(),
+    updatedAt
+  };
+}
+
+function subtractDailyFromGlobal(global: AnalyticsGlobalTotals, day: AnalyticsDailyRecord, updatedAt: string): AnalyticsGlobalTotals {
+  const subSafe = (a: string, b: string) => {
+    const diff = BigInt(a) - BigInt(b);
+    return (diff < 0n ? 0n : diff).toString();
+  };
+  return {
+    gdOneTimeDepositsWei: subSafe(global.gdOneTimeDepositsWei, day.gdOneTimeDepositsWei),
+    gdStreamedWei: subSafe(global.gdStreamedWei, day.gdStreamedWei),
+    aiCreditsUsedWei: subSafe(global.aiCreditsUsedWei, day.aiCreditsUsedWei),
+    gdTotalFlowRateWeiPerSecond: BigInt(global.gdTotalFlowRateWeiPerSecond).toString(),
     updatedAt
   };
 }
