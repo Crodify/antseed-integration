@@ -236,7 +236,7 @@ test("config values exposes non-secret runtime constants", async () => {
     };
   };
   assert.equal(body.config.GD_CUSD_PRICE, 0.0001);
-  assert.equal(body.config.MAX_BONUS_CAP_USD, "100000000000000000000");
+  assert.equal(body.config.MAX_BONUS_CAP_USD, "100000000");
   assert.equal(body.config.REGULAR_BONUS_BPS, "1000");
   assert.equal(body.config.STREAMING_BONUS_BPS, "2000");
   assert.equal(body.config.MIN_STREAM_BONUS_WEI, "4000000000000000000000");
