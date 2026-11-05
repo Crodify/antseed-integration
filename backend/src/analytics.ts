@@ -577,19 +577,20 @@ async function fetchStreamSnapshots(cfg: AnalyticsConfig, now: Date, dayStartUni
     };
 
     const response = await retryWithBackoff(
-      () =>
-        fetch(cfg.superfluidSubgraphUrl, {
+      async () => {
+        const res = await fetch(cfg.superfluidSubgraphUrl, {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify(body)
-        }),
+        });
+        if (!res.ok) {
+          throw new Error(`Superfluid subgraph HTTP ${res.status}`);
+        }
+        return res;
+      },
       3,
       500
     );
-
-    if (!response.ok) {
-      throw new Error(`Superfluid subgraph HTTP ${response.status}`);
-    }
 
     const json = (await response.json()) as {
       errors?: Array<any>;
@@ -759,10 +760,17 @@ async function getChainRpcUrls(kv: KV, chainId: number, fallbackRpcs: string[], 
 async function fetchRpcsFromChainlist(chainId: number): Promise<string[]> {
   const chainlistUrl = new URL(CHAINLIST_RPCS_URL);
 
-  const response = await retryWithBackoff(() => fetch(chainlistUrl.href), 3, 500);
-  if (!response.ok) {
-    throw new Error(`Chainlist HTTP ${response.status}`);
-  }
+  const response = await retryWithBackoff(
+    async () => {
+      const res = await fetch(chainlistUrl.href);
+      if (!res.ok) {
+        throw new Error(`Chainlist HTTP ${res.status}`);
+      }
+      return res;
+    },
+    3,
+    500
+  );
 
   const payload = (await response.json()) as Array<{
     chainId?: number;
@@ -877,10 +885,17 @@ async function getBlockByTimestamp(apiUrl: string, timestamp: number, closest: "
   url.searchParams.set("timestamp", String(timestamp));
   url.searchParams.set("closest", closest);
 
-  const response = await retryWithBackoff(() => fetch(url.href), 3, 300);
-  if (!response.ok) {
-    throw new Error(`Explorer HTTP ${response.status}`);
-  }
+  const response = await retryWithBackoff(
+    async () => {
+      const res = await fetch(url.href);
+      if (!res.ok) {
+        throw new Error(`Explorer HTTP ${res.status}`);
+      }
+      return res;
+    },
+    3,
+    300
+  );
 
   const payload = (await response.json()) as {
     status?: string;

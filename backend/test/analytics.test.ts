@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { getAnalyticsWindow, resolveRunDate, runAnalyticsAggregation } from "../src/analytics.js";
 import { Env } from "../src/env.js";
 import { encodeVaultEventLog } from "../src/celo-events.js";
+import { redactAddress, redactHash } from "../src/logging.js";
 
 class MemoryKV {
   private data = new Map<string, string>();
@@ -321,4 +322,13 @@ test("runAnalyticsAggregation calculates streamed G$ for streams active since be
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("log redaction masks addresses and transaction hashes (#33 Finding 12)", () => {
+  const addr = "0x1234567890abcdef1234567890abcdef12345678";
+  const hash = "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+  assert.equal(redactAddress(addr), "0x1234...5678");
+  assert.equal(redactHash(hash), "0xabcdef12...7890");
+  assert.equal(redactAddress(undefined), undefined);
+  assert.equal(redactHash(undefined), undefined);
 });

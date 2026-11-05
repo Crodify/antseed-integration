@@ -38,19 +38,17 @@ export function logError(event: string, data?: LogData): void {
 }
 
 export function redactAddress(value: string | undefined): string | undefined {
-  return value;
-  //   if (!value) return undefined;
-  //   const normalized = value.toLowerCase();
-  //   if (!normalized.startsWith("0x") || normalized.length < 10) return "redacted";
-  //   return `${normalized.slice(0, 6)}...${normalized.slice(-4)}`;
+  if (!value) return undefined;
+  const normalized = value.toLowerCase();
+  if (!normalized.startsWith("0x") || normalized.length < 10) return "redacted";
+  return `${normalized.slice(0, 6)}...${normalized.slice(-4)}`;
 }
 
 export function redactHash(value: string | undefined): string | undefined {
-  return value;
-  //   if (!value) return undefined;
-  //   const normalized = value.toLowerCase();
-  //   if (!normalized.startsWith("0x") || normalized.length < 14) return "redacted";
-  //   return `${normalized.slice(0, 10)}...${normalized.slice(-4)}`;
+  if (!value) return undefined;
+  const normalized = value.toLowerCase();
+  if (!normalized.startsWith("0x") || normalized.length < 14) return "redacted";
+  return `${normalized.slice(0, 10)}...${normalized.slice(-4)}`;
 }
 
 export function errorMessage(error: unknown): string {
