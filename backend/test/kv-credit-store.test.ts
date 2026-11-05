@@ -549,3 +549,35 @@ test("recordStreamFlowRate does not mirror the rate onto the root account", asyn
   // The totals still aggregate on the root, which is what mirroring is for.
   assert.equal((await store.getUser("0xROOT")).totalGDStreamedWei, "1000000000000000000");
 });
+
+test("credit-id index retains all entries beyond 500 without truncation (#33 Finding 7)", async () => {
+  const store = new KVCreditStore(new MemoryKV() as never);
+  const account = "0xHIGHVOLUME";
+
+  // Record 520 credits to exceed the former 500-entry truncation threshold
+  for (let i = 0; i < 520; i++) {
+    await store.recordGdCredit({
+      id: `deposit:${i}`,
+      account,
+      source: "deposit",
+      gdAmountWei: 1_000_000_000_000_000_000n,
+      gdPrice: GD_PRICE,
+      isVerified: false,
+      maxBonusCapUsd: 100_000_000n
+    });
+  }
+
+  const allCredits = await store.getGdCredits(account);
+  assert.equal(allCredits.length, 520, "must retain all 520 entries without dropping oldest");
+  assert.equal(allCredits[0].id, "deposit:0", "oldest entry must be preserved");
+  assert.equal(allCredits[519].id, "deposit:519", "newest entry must be preserved");
+
+  const history = await store.getGdCreditHistory(account, { limit: 100, offset: 0 });
+  assert.equal(history.total, 520, "history total must report full count");
+  assert.equal(history.items.length, 100);
+  assert.equal(history.hasMore, true);
+
+  const tailPage = await store.getGdCreditHistory(account, { limit: 100, offset: 500 });
+  assert.equal(tailPage.items.length, 20, "tail entries beyond 500 must remain accessible");
+  assert.equal(tailPage.hasMore, false);
+});

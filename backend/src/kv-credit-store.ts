@@ -319,7 +319,7 @@ export class KVCreditStore {
     const key = `${USER_GD_CREDITS_PREFIX}${account}`;
     const ids = (await this.getJson<string[]>(key)) ?? [];
     if (!ids.includes(entryId)) ids.push(entryId);
-    await this.putJson(key, ids.slice(-500));
+    await this.putJson(key, ids);
   }
 
   private async getMonthlyBonusUsed(rootAccount: string, month: string): Promise<bigint> {
