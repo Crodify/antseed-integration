@@ -1295,6 +1295,95 @@ test("fundCredit skips deposit and marks failed when service is not buyer operat
   });
 });
 
+test("fundCredit recovers already-used deposit even after operator revocation", async () => {
+  const account = "0x0000000000000000000000000000000000000abc";
+  const buyer = "0x0000000000000000000000000000000000000aaa";
+  const kv = new MemoryKV();
+  const store = new KVCreditStore(kv as never);
+  const entry: GdCreditEntry = {
+    id: "deposit:duplicate-recovery:test",
+    account: account.toLowerCase(),
+    rootAccount: account.toLowerCase(),
+    source: "deposit",
+    gdAmountWei: "1000",
+    principalUsd: "50",
+    bonusUsd: "5",
+    totalCreditUsd: "55",
+    fundingStatus: "pending",
+    createdAt: new Date().toISOString(),
+    streamUpdateMonth: "2026-08",
+    buyerAddress: buyer.toLowerCase()
+  };
+
+  let depositCalls = 0;
+  const vault = {
+    enabled: true,
+    async isDepositUsed() {
+      return true;
+    },
+    async isBuyerOperator() {
+      return { enabled: true, buyer: buyer.toLowerCase(), isOperator: false };
+    },
+    async depositForBuyerWithId() {
+      depositCalls += 1;
+      return { enabled: true, buyer, amountUsd: "55", txHash: "0xrecovered" };
+    }
+  };
+
+  const result = await fundCredit(entry, store, vault as never);
+  const updatedEntry = (await kv.get("gd-credit:deposit:duplicate-recovery:test", "json")) as GdCreditEntry;
+
+  assert.equal(depositCalls, 1);
+  assert.equal(updatedEntry.fundingStatus, "funded");
+  assert.equal(result.fundingStatus, "funded");
+});
+
+test("fundCredit retries previously failed entry when operator status is restored", async () => {
+  const account = "0x0000000000000000000000000000000000000abc";
+  const buyer = "0x0000000000000000000000000000000000000aaa";
+  const kv = new MemoryKV();
+  const store = new KVCreditStore(kv as never);
+  const initialEntry: GdCreditEntry = {
+    id: "deposit:restored-retry:test",
+    account: account.toLowerCase(),
+    rootAccount: account.toLowerCase(),
+    source: "deposit",
+    gdAmountWei: "1000",
+    principalUsd: "50",
+    bonusUsd: "5",
+    totalCreditUsd: "55",
+    fundingStatus: "failed",
+    fundingError: "service_not_buyer_operator",
+    createdAt: new Date().toISOString(),
+    streamUpdateMonth: "2026-08",
+    buyerAddress: buyer.toLowerCase()
+  };
+  await kv.put(`gd-credit:${initialEntry.id}`, JSON.stringify(initialEntry));
+
+  let depositCalls = 0;
+  const vault = {
+    enabled: true,
+    async isDepositUsed() {
+      return false;
+    },
+    async isBuyerOperator() {
+      return { enabled: true, buyer: buyer.toLowerCase(), isOperator: true };
+    },
+    async depositForBuyerWithId() {
+      depositCalls += 1;
+      return { enabled: true, buyer, amountUsd: "55", txHash: "0xrestoredsuccess" };
+    }
+  };
+
+  const result = await fundCredit(initialEntry, store, vault as never);
+  const updatedEntry = (await kv.get("gd-credit:deposit:restored-retry:test", "json")) as GdCreditEntry;
+
+  assert.equal(depositCalls, 1);
+  assert.equal(updatedEntry.fundingStatus, "funded");
+  assert.equal(updatedEntry.fundingTxHash, "0xrestoredsuccess");
+  assert.equal(result.fundingStatus, "funded");
+});
+
 test("POST /v1/accounts/:account/withdraw returns 400 on missing body fields", async () => {
   const account = "0x0000000000000000000000000000000000000abc";
   const res = await worker.fetch(

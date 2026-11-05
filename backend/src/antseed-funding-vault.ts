@@ -102,6 +102,12 @@ export class AntSeedFundingVaultClient {
     };
   }
 
+  async isDepositUsed(id: string): Promise<boolean> {
+    if (!this.contract) return false;
+    const idHash = this.toBytes32Id(id);
+    return Boolean(await this.contract.usedDepositIds(idHash));
+  }
+
   async depositForBuyerWithId(buyer: string, principalUsd: bigint, bonusUsd: bigint, id: string, requireMinimumPrincipal = false): Promise<AntSeedFundingResult> {
     const total = principalUsd + bonusUsd;
     logInfo("funding.bridge.deposit.start", {

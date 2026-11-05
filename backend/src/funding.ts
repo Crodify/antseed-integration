@@ -30,6 +30,9 @@ export async function fundCredit(
       }
     };
   }
+  if (entry.fundingStatus === "failed") {
+    entry = await store.retryFailedFunding(entry);
+  }
   const principalUsd = BigInt(entry.principalUsd);
   const bonusUsd = BigInt(entry.bonusUsd);
   logInfo("funding.start", {
@@ -43,7 +46,11 @@ export async function fundCredit(
   });
   try {
     const shouldCredit = principalUsd + bonusUsd > 0n;
-    if (shouldCredit && antseedFundingVault.enabled && typeof antseedFundingVault.isBuyerOperator === "function") {
+    const isAlreadyUsed = shouldCredit && antseedFundingVault.enabled && typeof antseedFundingVault.isDepositUsed === "function"
+      ? await antseedFundingVault.isDepositUsed(entry.id)
+      : false;
+
+    if (shouldCredit && !isAlreadyUsed && antseedFundingVault.enabled && typeof antseedFundingVault.isBuyerOperator === "function") {
       const operatorStatus = await antseedFundingVault.isBuyerOperator(buyer);
       if (!operatorStatus.isOperator) {
         logWarn("funding.deposit.skipped.not-operator", {
