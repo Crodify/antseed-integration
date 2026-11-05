@@ -1213,6 +1213,88 @@ test("POST /v1/accounts/:account/operator-revoke returns enabled:false when vaul
   assert.equal(body.bridge.nonce, "0");
 });
 
+test("POST /v1/accounts/:account/operator-reset returns 400 on missing body fields", async () => {
+  const buyer = "0x0000000000000000000000000000000000000abc";
+  const res = await worker.fetch(
+    new Request(`https://worker.test/v1/accounts/${buyer}/operator-reset`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({})
+    }),
+    env(),
+    makeExecutionContext()
+  );
+  assert.equal(res.status, 400);
+});
+
+test("POST /v1/accounts/:account/operator-reset returns enabled:false when vault not configured", async () => {
+  const buyer = "0x0000000000000000000000000000000000000abc";
+  const res = await worker.fetch(
+    new Request(`https://worker.test/v1/accounts/${buyer}/operator-reset`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        nonce: "0",
+        signature: `0x${"a".repeat(130)}`
+      })
+    }),
+    env(),
+    makeExecutionContext()
+  );
+  assert.equal(res.status, 200);
+  const body = (await res.json()) as { buyer: string; bridge: { enabled: boolean; nonce: string } };
+  assert.equal(body.buyer, buyer);
+  assert.equal(body.bridge.enabled, false);
+  assert.equal(body.bridge.nonce, "0");
+});
+
+test("fundCredit skips deposit and marks failed when service is not buyer operator", async () => {
+  const account = "0x0000000000000000000000000000000000000abc";
+  const buyer = "0x0000000000000000000000000000000000000aaa";
+  const kv = new MemoryKV();
+  const store = new KVCreditStore(kv as never);
+  const entry: GdCreditEntry = {
+    id: "deposit:not-operator:test",
+    account: account.toLowerCase(),
+    rootAccount: account.toLowerCase(),
+    source: "deposit",
+    gdAmountWei: "1000",
+    principalUsd: "50",
+    bonusUsd: "5",
+    totalCreditUsd: "55",
+    fundingStatus: "pending",
+    createdAt: new Date().toISOString(),
+    streamUpdateMonth: "2026-08",
+    buyerAddress: buyer.toLowerCase()
+  };
+
+  let depositCalls = 0;
+  const vault = {
+    enabled: true,
+    async isBuyerOperator() {
+      return { enabled: true, buyer: buyer.toLowerCase(), isOperator: false };
+    },
+    async depositForBuyerWithId() {
+      depositCalls += 1;
+      return { enabled: true, buyer, amountUsd: "55", txHash: "0xnever" };
+    }
+  };
+
+  const result = await fundCredit(entry, store, vault as never);
+  const updatedEntry = (await kv.get("gd-credit:deposit:not-operator:test", "json")) as GdCreditEntry;
+
+  assert.equal(depositCalls, 0);
+  assert.equal(updatedEntry.fundingStatus, "failed");
+  assert.equal(updatedEntry.fundingError, "service_not_buyer_operator");
+  assert.equal(result.fundingStatus, "failed");
+  assert.deepEqual(result.bridge, {
+    enabled: true,
+    buyer: buyer.toLowerCase(),
+    amountUsd: "55",
+    error: "service_not_buyer_operator"
+  });
+});
+
 test("POST /v1/accounts/:account/withdraw returns 400 on missing body fields", async () => {
   const account = "0x0000000000000000000000000000000000000abc";
   const res = await worker.fetch(

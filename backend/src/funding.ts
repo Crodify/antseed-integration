@@ -43,6 +43,31 @@ export async function fundCredit(
   });
   try {
     const shouldCredit = principalUsd + bonusUsd > 0n;
+    if (shouldCredit && antseedFundingVault.enabled && typeof antseedFundingVault.isBuyerOperator === "function") {
+      const operatorStatus = await antseedFundingVault.isBuyerOperator(buyer);
+      if (!operatorStatus.isOperator) {
+        logWarn("funding.deposit.skipped.not-operator", {
+          entryId: entry.id,
+          source: entry.source,
+          account: redactAddress(entry.account),
+          buyer: redactAddress(buyer)
+        });
+        const updated = await store.markFundingResult(entry, {
+          funded: false,
+          error: "service_not_buyer_operator"
+        });
+        return {
+          ...updated,
+          depositId: entry.id,
+          bridge: {
+            enabled: true,
+            buyer,
+            amountUsd: entry.totalCreditUsd,
+            error: "service_not_buyer_operator"
+          }
+        };
+      }
+    }
     const bridge = shouldCredit
       ? await antseedFundingVault.depositForBuyerWithId(buyer, principalUsd, bonusUsd, entry.id, entry.source === "deposit")
       : { enabled: antseedFundingVault.enabled, buyer, amountUsd: "0" };

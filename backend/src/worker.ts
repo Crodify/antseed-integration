@@ -422,18 +422,19 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     return json({ buyer, bridge });
   }
 
-  const operatorRevokeMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/operator-revoke$/);
-  if (request.method === "POST" && operatorRevokeMatch) {
-    const buyer = decodeURIComponent(operatorRevokeMatch[1]).toLowerCase();
+  const operatorRevokeOrResetMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/(operator-revoke|operator-reset)$/);
+  if (request.method === "POST" && operatorRevokeOrResetMatch) {
+    const isReset = operatorRevokeOrResetMatch[2] === "operator-reset";
+    const buyer = decodeURIComponent(operatorRevokeOrResetMatch[1]).toLowerCase();
     const body = await parseJson(request);
     const parsed = OperatorConsentSchema.safeParse(body);
     if (!parsed.success) return json({ error: parsed.error.flatten() }, 400);
-    logInfo("operator.revoke.request", {
+    logInfo(isReset ? "operator.reset.request" : "operator.revoke.request", {
       buyer: redactAddress(buyer),
       nonce: parsed.data.nonce
     });
     const bridge = await antseedFundingVault.revokeBuyerOperator(buyer, BigInt(parsed.data.nonce), parsed.data.signature);
-    logInfo("operator.revoke.result", {
+    logInfo(isReset ? "operator.reset.result" : "operator.revoke.result", {
       buyer: redactAddress(buyer),
       enabled: bridge.enabled,
       txHash: redactHash(bridge.txHash)
